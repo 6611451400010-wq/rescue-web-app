@@ -1,0 +1,8 @@
+{
+  "appId": "com.dtc.rescueapp.worker",
+  "appName": "DTC \u0e0a\u0e48\u0e32\u0e07",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  }
+}

@@ -1,11 +1,44 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import Image from 'next/image';
+import dynamic from 'next/dynamic';
+import { Geolocation } from '@capacitor/geolocation';
 import { supabase } from '@/lib/supabaseClient';
-import { createJob as createJobApi, subscribeJob } from '@/lib/dtc-api';
+import {
+  createJob as createJobApi,
+  subscribeJob,
+  getJob,
+  recordJobPayment,
+  sendChatMessage,
+  submitJobReview,
+  registerCustomer,
+  signInCustomer,
+  signOutCustomer,
+  type TowJob,
+  type CustomerProfile,
+} from '@/lib/dtc-api';
+// แก้บั๊กใหญ่: ทั้งไฟล์นี้เดิม insert()/update() ตรงเข้าตาราง payments, chat_messages,
+// reviews, technicians ทั้งหมด — โดน RLS (0001_lock_down_rls.sql) บล็อกเงียบๆ ทุกจุด เพราะ
+// ฝั่งลูกค้าเป็น anon role ล้วน ไม่มี Supabase Auth session (ตามที่ dtc-api.ts บันทึกไว้เอง
+// บรรทัด 435-441, 578-580) error แค่ถูก console.error ไม่ throw ไม่ขึ้น toast เลย ทำให้ดู
+// เหมือนกดสำเร็จ (state ในเครื่อง/optimistic update ยังอัปเดต) แต่ DB จริงไม่เคยเปลี่ยนแปลง —
+// นี่คือสาเหตุจริงที่ banner แนบสลิปใหม่/ข้อความแจ้งช่างไม่เคยขึ้นเลยไม่ว่าจะกดกี่ครั้ง เปลี่ยนมา
+// เรียกผ่าน RPC ทั้งหมด (recordJobPayment / sendChatMessage / submitJobReview) แทน
 // หมายเหตุ: ยังไม่เจอปุ่ม/ฟังก์ชันยกเลิกงานตรงๆ ในไฟล์นี้ ถ้าจะทำเพิ่ม ให้ import
 // cancelJob จาก '@/lib/dtc-api' แล้วเรียก cancelJob(currentJobId) แทนการ update ตรง
+
+// แผนที่ติดตามงาน real-time จริงด้วย Leaflet — ต้อง dynamic import แบบ ssr:false เพราะ
+// ไลบรารี leaflet อ่านค่า window ตอน import ซึ่งจะพังถ้า Next.js เรียกรันฝั่ง server (ดู
+// หมายเหตุเต็มในไฟล์ components/LiveTrackingMap.tsx)
+const LiveTrackingMap = dynamic(() => import('@/components/LiveTrackingMap'), {
+  ssr: false,
+  loading: () => (
+    <div className="flex h-64 w-full items-center justify-center rounded-2xl border border-slate-300/80 bg-slate-100 text-[11px] font-bold text-slate-400 shadow-md animate-pulse">
+      กำลังโหลดแผนที่...
+    </div>
+  ),
+});
 import {
   Wifi, 
   WifiOff,
@@ -59,7 +92,8 @@ import {
   PlusCircle,
   Lock,
   FileCheck2,
-  PhoneCall
+  PhoneCall,
+  Check
 } from 'lucide-react';
 
 type Language = 'EN' | 'TH' | 'CN';
@@ -72,7 +106,7 @@ interface Technician {
   rating: number;
   jobs: number;
   plateNumber: string;
-  photoUrl?: string; // รูปโปรไฟล์/โลโก้ของช่าง (ดีฟอลต์ /M2.png)
+  photoUrl?: string; // รูปโปรไฟล์/โลโก้ของช่าง (ดีฟอลต์ /M5.png)
   status?: 'online' | 'working' | 'break' | 'offline'; // สถานะสด อัปเดตจากตาราง technicians ผ่าน Supabase Realtime
 }
 
@@ -83,7 +117,7 @@ const mockAssignedTech: Technician = {
   rating: 4.9,
   jobs: 210,
   plateNumber: '2กข 5544',
-  photoUrl: '/M2.png',
+  photoUrl: '/M5.png',
   status: 'online'
 };
 
@@ -96,8 +130,7 @@ const translations = {
     forgetPassword: 'Forget Password ?',
     signIn: 'Sign in',
     signUpEmail: 'Sign up with Email',
-    signUpGoogle: 'Sign up with Google',
-    signUpApple: 'Sign up with Apple',
+    signUpLine: 'Sign up with Line',
     agreeTermsText: 'By signing in, you agree to our ',
     termsLink: 'Terms of Service',
     andText: ' and ',
@@ -117,6 +150,10 @@ const translations = {
     createNewPasswordTitle: 'Create New Password',
     newPasswordLabel: 'Password',
     confirmPasswordLabel: 'Confirm Password',
+    passwordMustContain: 'Password must contain:',
+    pwdReqLength: 'At least 8 characters',
+    pwdReqUppercase: 'One uppercase letter',
+    pwdReqNumberSpecial: 'One number & special character',
     emailRequiredErr: 'Please enter your email',
     passwordRequiredErr: 'Please enter your password',
     newPasswordRequiredErr: 'Please enter a new password',
@@ -204,8 +241,7 @@ const translations = {
     forgetPassword: 'ลืมรหัสผ่าน ?',
     signIn: 'เข้าสู่ระบบ',
     signUpEmail: 'ลงทะเบียนด้วย อีเมล',
-    signUpGoogle: 'ลงทะเบียนด้วย Google',
-    signUpApple: 'ลงทะเบียนด้วย Apple',
+    signUpLine: 'ลงทะเบียนด้วย Line',
     agreeTermsText: 'ในการเข้าสู่ระบบ คุณยอมรับ ',
     termsLink: 'เงื่อนไขการให้บริการ',
     andText: ' และ ',
@@ -225,6 +261,10 @@ const translations = {
     createNewPasswordTitle: 'ตั้งรหัสผ่านใหม่',
     newPasswordLabel: 'รหัสผ่านใหม่',
     confirmPasswordLabel: 'ยืนยันรหัสผ่านใหม่',
+    passwordMustContain: 'รหัสผ่านต้องมี:',
+    pwdReqLength: 'อย่างน้อย 8 ตัวอักษร',
+    pwdReqUppercase: 'มีตัวอักษรพิมพ์ใหญ่อย่างน้อย 1 ตัว',
+    pwdReqNumberSpecial: 'มีตัวเลขและอักขระพิเศษอย่างน้อย 1 ตัว',
     emailRequiredErr: 'กรุณากรอกอีเมล',
     passwordRequiredErr: 'กรุณากรอกรหัสผ่าน',
     newPasswordRequiredErr: 'กรุณากรอกรหัสผ่านใหม่',
@@ -312,8 +352,7 @@ const translations = {
     forgetPassword: '忘记密码？',
     signIn: '登录',
     signUpEmail: '通过电子邮件注册',
-    signUpGoogle: '通过 Google 注册',
-    signUpApple: '通过 Apple 注册',
+    signUpLine: '通过 Line 注册',
     agreeTermsText: '登录即表示您同意 our',
     termsLink: '服务条款',
     andText: ' 和 ',
@@ -333,6 +372,10 @@ const translations = {
     createNewPasswordTitle: '创建新密码',
     newPasswordLabel: '新密码',
     confirmPasswordLabel: '确认新密码',
+    passwordMustContain: '密码必须包含：',
+    pwdReqLength: '至少 8 个字符',
+    pwdReqUppercase: '至少一个大写字母',
+    pwdReqNumberSpecial: '至少一个数字和特殊字符',
     emailRequiredErr: '请输入您的电子邮件',
     passwordRequiredErr: '请输入您的密码',
     newPasswordRequiredErr: '请输入新密码',
@@ -439,8 +482,29 @@ const FlagCN = () => (
   </svg>
 );
 
+// ย้าย bannerImages ออกมาเป็นค่าคงที่นอก component เพื่อให้ reference คงที่ทุก render
+// (เดิมประกาศไว้ข้างในฟังก์ชัน ทำให้ array ถูกสร้างใหม่ทุกครั้งที่ re-render และไปรีเซ็ต
+// ตัวจับเวลาเลื่อนแบนเนอร์อัตโนมัติซ้ำๆ จนไม่มีทางเลื่อนเองได้สักที)
+const bannerImages = ['/b1.png', '/b2.png', '/b3.png'];
+
 export default function App() {
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
+  // ติดตามสถานะการชำระเงินของงานปัจจุบันแบบเรียลไทม์ — เดิมฝั่งลูกค้า insert ครั้งเดียวจบ
+  // ไม่เคยดึงกลับมาดูอีกเลย ทำให้ไม่รู้เลยว่าช่างปฏิเสธสลิปไปหรือยัง
+  const [myPayment, setMyPayment] = useState<{
+    id: string;
+    slip_url: string | null;
+    amount: number | null;
+    payment_method: 'transfer' | 'cash' | 'credit';
+    status: 'pending' | 'verified' | 'rejected';
+  } | null>(null);
+  const [reslipFile, setReslipFile] = useState<File | null>(null);
+  const [isReuploadingSlip, setIsReuploadingSlip] = useState(false);
+  const reslipFileInputRef = useRef<HTMLInputElement | null>(null);
+  // input แนบสลิปใหม่ "ในหน้าแชท" แยก ref ต่างหากจากตัวบนหน้ารายละเอียดงาน (reslipFileInputRef)
+  // เพราะทั้งสอง banner mount พร้อมกันได้จริง (chat modal เป็น overlay ลอยทับ ไม่ผูกกับ activeTab)
+  // ถ้าใช้ ref เดียวกันจะมีแค่ input ตัวที่ mount หลังสุดเท่านั้นที่ทำงาน — แชร์กันแค่ state (reslipFile) พอ
+  const reslipChatFileInputRef = useRef<HTMLInputElement | null>(null);
   const [step, setStep] = useState<number>(1);
   const [time, setTime] = useState<string>('');
   const [batteryLevel, setBatteryLevel] = useState<number>(100);
@@ -457,6 +521,24 @@ export default function App() {
   const [showPassword, setShowPassword] = useState<boolean>(false);
   const [showNewPassword, setShowNewPassword] = useState<boolean>(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState<boolean>(false);
+  // รหัสผ่านตอนสมัครสมาชิก (แยกออกจาก registerForm เพื่อไม่ให้รหัสผ่านหลุดไปปนกับ
+  // ข้อมูลที่ใช้แสดงผล/ส่งไป Supabase เช่นตอนสร้างงาน)
+  const [regPassword, setRegPassword] = useState<string>('');
+  const [regConfirmPassword, setRegConfirmPassword] = useState<string>('');
+  // ---- สมัครสมาชิกลูกค้า: เช็คเงื่อนไขรหัสผ่านแบบเรียลไทม์ (checklist แบบเดียวกับฝั่งช่าง) ----
+  const regPasswordChecks = useMemo(
+    () => ({
+      length: regPassword.length >= 8,
+      uppercase: /[A-Z]/.test(regPassword),
+      numberSpecial: /[0-9]/.test(regPassword) && /[^A-Za-z0-9]/.test(regPassword),
+    }),
+    [regPassword]
+  );
+  const [regPasswordErr, setRegPasswordErr] = useState<string>('');
+  const [regConfirmPasswordErr, setRegConfirmPasswordErr] = useState<string>('');
+  const [regEmailErrMsg, setRegEmailErrMsg] = useState<string>('');
+  const [showRegPassword, setShowRegPassword] = useState<boolean>(false);
+  const [showRegConfirmPassword, setShowRegConfirmPassword] = useState<boolean>(false);
   
   const [showTermsModal, setShowTermsModal] = useState<boolean>(false);
   const [showPrivacyPolicyModal, setShowPrivacyPolicyModal] = useState<boolean>(false);
@@ -489,7 +571,7 @@ export default function App() {
 
   const [showTrackingDetail, setShowTrackingDetail] = useState<boolean>(false);
   const [truckProgress, setTruckProgress] = useState<number>(0);
-  const [trackingPhase, setTrackingPhase] = useState<'moving_to_red' | 'loading' | 'moving_to_green' | 'completed'>('moving_to_red');
+  const [trackingPhase, setTrackingPhase] = useState<'moving_to_red' | 'loading' | 'on_site' | 'moving_to_green' | 'completed'>('moving_to_red');
   const [hasActiveBooking, setHasActiveBooking] = useState<boolean>(false);
   // true ตั้งแต่ช่างกดรับงานจริงจากฝั่ง t3 (ผ่าน Supabase realtime) เท่านั้น — ก่อนหน้านี้ต้องรอ ห้ามเด้งไปหน้าแมพ
   const [techAccepted, setTechAccepted] = useState<boolean>(false);
@@ -592,7 +674,6 @@ export default function App() {
   // State ป๊อปอัพขอบคุณหลังส่งรีวิวสำเร็จ (แสดงในกรอบมือถือ แทน alert())
   const [showReviewThanksModal, setShowReviewThanksModal] = useState<boolean>(false);
 
-  const bannerImages = ['/b1.png', '/b2.png', '/b3.png'];
   const [currentBannerIndex, setCurrentBannerIndex] = useState<number>(0);
   const [expandedBannerUrl, setExpandedBannerUrl] = useState<string | null>(null);
 
@@ -604,14 +685,14 @@ export default function App() {
   });
 
   const [registerForm, setRegisterForm] = useState({
-    name: 'สมชาย',
-    surname: 'ใจดี',
-    phoneNumber: '081-234-5678',
-    email: 'somchai@example.com',
+    name: '',
+    surname: '',
+    phoneNumber: '',
+    email: '',
     nationalType: 'National',
-    carNumber: '1กข 8899 กทม.',
-    carBrand: 'Toyota',
-    carModel: 'Camry',
+    carNumber: '',
+    carBrand: '',
+    carModel: '',
     allowLocation: 'Yes'
   });
 
@@ -636,8 +717,13 @@ export default function App() {
   const [regEmailErr, setRegEmailErr] = useState<boolean>(false);
   const [regCarNoErr, setRegCarNoErr] = useState<boolean>(false);
 
-  const [loginEmail, setLoginEmail] = useState<string>('somchai@example.com');
-  const [loginPassword, setLoginPassword] = useState<string>('123456');
+  const [loginEmail, setLoginEmail] = useState<string>('');
+  const [loginPassword, setLoginPassword] = useState<string>('');
+
+  // โปรไฟล์ลูกค้าจริงจาก Supabase Auth + ตาราง customers (แทนที่บัญชีปลอมใน localStorage
+  // เดิม) — ตั้งค่าตอนสมัคร/ล็อกอินสำเร็จ ใช้ยืนยันว่ามี session จริงอยู่ไหม
+  const [customerProfile, setCustomerProfile] = useState<CustomerProfile | null>(null);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
   const [emailError, setEmailError] = useState<boolean>(false);
   const [passwordError, setPasswordError] = useState<string>('');
 
@@ -702,46 +788,43 @@ export default function App() {
 
   // ขอพิกัด GPS จริงแบบ Promise เพื่อให้ "ตรึง GPS" และ "แชร์พิกัด"
   // ใช้พิกัดเดียวกัน และแก้ปัญหาการกดแชร์ครั้งแรกแล้วไม่แชร์
-  const requestCurrentLocation = (): Promise<{ lat: number; lng: number }> => {
-    return new Promise((resolve, reject) => {
-      if (!navigator.geolocation) {
-        reject({ code: -1 });
-        return;
-      }
+  const requestCurrentLocation = async (): Promise<{ lat: number; lng: number }> => {
+    // ใช้ปลั๊กอิน @capacitor/geolocation แทน navigator.geolocation ตรงๆ เพราะตอนรันเป็น
+    // native app ผ่าน Capacitor เบราว์เซอร์ WebView ไม่สามารถขอสิทธิ์ ACCESS_FINE_LOCATION
+    // ของ Android เองได้ — ปลั๊กอินนี้จัดการขอสิทธิ์ + เพิ่ม permission ใน
+    // AndroidManifest.xml ให้อัตโนมัติตอน `npx cap sync android` (โค้ดยังใช้ได้ปกติ
+    // ตอนรันในเบราว์เซอร์ธรรมดาเหมือนเดิม ปลั๊กอินสลับ implementation ให้เอง)
+    try {
+      await Geolocation.requestPermissions();
+    } catch {
+      // บางแพลตฟอร์ม (เช่นเบราว์เซอร์เดสก์ท็อป) ไม่มี requestPermissions แยกให้เรียก — ข้ามได้
+    }
 
-      const resolveCoords = (position: GeolocationPosition) => {
-        resolve({
-          lat: position.coords.latitude,
-          lng: position.coords.longitude
-        });
-      };
-
-      navigator.geolocation.getCurrentPosition(
-        resolveCoords,
-        (error) => {
-          // มือถือหลายรุ่นเปิด high accuracy แล้ว timeout/หาไม่เจอบ่อยมาก
-          // ถ้าไม่ใช่เพราะผู้ใช้ปฏิเสธสิทธิ์ (code 1) ให้ลองใหม่แบบความแม่นยำต่ำก่อน ค่อยแจ้ง error จริง
-          if (error?.code !== 1) {
-            navigator.geolocation.getCurrentPosition(
-              resolveCoords,
-              (fallbackError) => reject(fallbackError),
-              {
-                enableHighAccuracy: false,
-                timeout: 20000,
-                maximumAge: 60000
-              }
-            );
-          } else {
-            reject(error);
-          }
-        },
-        {
-          enableHighAccuracy: true,
-          timeout: 10000,
-          maximumAge: 0
-        }
-      );
+    const toCoords = (position: { coords: { latitude: number; longitude: number } }) => ({
+      lat: position.coords.latitude,
+      lng: position.coords.longitude,
     });
+
+    try {
+      const position = await Geolocation.getCurrentPosition({
+        enableHighAccuracy: true,
+        timeout: 10000,
+        maximumAge: 0,
+      });
+      return toCoords(position);
+    } catch (error: any) {
+      // มือถือหลายรุ่นเปิด high accuracy แล้ว timeout/หาไม่เจอบ่อยมาก
+      // ถ้าไม่ใช่เพราะผู้ใช้ปฏิเสธสิทธิ์ (code 1) ให้ลองใหม่แบบความแม่นยำต่ำก่อน ค่อยแจ้ง error จริง
+      if (error?.code !== 1) {
+        const fallbackPosition = await Geolocation.getCurrentPosition({
+          enableHighAccuracy: false,
+          timeout: 20000,
+          maximumAge: 60000,
+        });
+        return toCoords(fallbackPosition);
+      }
+      throw error;
+    }
   };
 
   const formatGpsLocation = (lat: number, lng: number) => {
@@ -816,6 +899,15 @@ export default function App() {
       setIsFetchingLocation(false);
     }
   };
+
+  // ดึงตำแหน่ง GPS อัตโนมัติทันทีที่เข้าแท็บ "เรียกรถฉุกเฉิน" — ไม่ต้องรอผู้ใช้แตะเอง
+  // (ตามที่ต้องการให้ล็อกอินเสร็จแล้วกดเรียกได้ทันทีแบบง่ายที่สุด)
+  useEffect(() => {
+    if (activeTab === 'request' && !liveCoords && !isFetchingLocation) {
+      handleFetchLiveLocation();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
 
   // แชร์พิกัดฉุกเฉินให้คนที่ไว้ใจ / ศูนย์บริการ
   const handleShareLocation = async () => {
@@ -944,17 +1036,20 @@ export default function App() {
     setHasUnreadChat(false);
   };
 
-  // ฟังก์ชันส่งข้อความแชตหาช่าง — เดิมอัปเดตแค่ state ในเครื่อง ไม่เคยยิงเข้า Supabase จริง
-  // ทำให้ข้อความไม่เคยไปถึงฝั่งช่างเลย ตอนนี้ insert เข้า chat_messages จริง
+  // ฟังก์ชันส่งข้อความแชตหาช่าง — เดิม insert() ตรงเข้า chat_messages ซึ่งโดน RLS บล็อกเงียบๆ
+  // (ฝั่งลูกค้าเป็น anon role ไม่มี Supabase Auth session) ข้อความเลยไม่เคยไปถึงฝั่งช่างจริง
+  // แม้จะโชว์ในแชทฝั่งลูกค้าเองก็ตาม (เพราะ optimistic update ใน state เครื่องอัปเดตไปแล้ว)
+  // เปลี่ยนมาเรียกผ่าน sendChatMessage() RPC แทน
   const handleSendMessage = async () => {
     if (!inputMsg.trim() || !currentJobId) return;
     const text = inputMsg.trim();
     setChatMessages((prev) => [...prev, { sender: 'user', text }]);
     setInputMsg('');
-    const { error } = await supabase
-      .from('chat_messages')
-      .insert([{ job_id: currentJobId, sender: 'customer', text }]);
-    if (error) console.error('Error sending chat message:', error);
+    try {
+      await sendChatMessage({ jobId: currentJobId, sender: 'customer', text });
+    } catch (err) {
+      console.error('Error sending chat message:', err);
+    }
   };
 
   // ฟังก์ชันจัดการรูปภาพสลิป
@@ -998,17 +1093,12 @@ export default function App() {
         .from('payment-slips')
         .getPublicUrl(filePath);
 
-      const { error: insertError } = await supabase.from('payments').insert([
-        {
-          job_id: jobId,
-          slip_url: publicUrlData.publicUrl,
-          amount: towingRequest.calculatedEtvPrice,
-          payment_method: 'transfer',
-          status: 'pending',
-        },
-      ]);
-
-      if (insertError) throw insertError;
+      await recordJobPayment({
+        jobId,
+        amount: towingRequest.calculatedEtvPrice,
+        paymentMethod: 'promptpay',
+        slipUrl: publicUrlData.publicUrl,
+      });
 
       setAppToast({ message: 'ส่งสลิปโอนเงินเรียบร้อย รอช่างตรวจสอบ', type: 'success' });
     } catch (err) {
@@ -1029,16 +1119,12 @@ export default function App() {
       return;
     }
     try {
-      const { error } = await supabase.from('payments').insert([
-        {
-          job_id: jobId,
-          slip_url: null,
-          amount: towingRequest.calculatedEtvPrice,
-          payment_method: selectedPaymentMethod,
-          status: 'pending',
-        },
-      ]);
-      if (error) throw error;
+      await recordJobPayment({
+        jobId,
+        amount: towingRequest.calculatedEtvPrice,
+        paymentMethod: selectedPaymentMethod,
+        slipUrl: null,
+      });
     } catch (err) {
       console.error('Error creating payment record:', err);
     }
@@ -1067,34 +1153,19 @@ export default function App() {
     };
     setServiceHistory(prev => [newHistoryItem, ...prev]);
 
-    // อัปเดตคะแนนสะสมของช่างจริงใน Supabase (เฉลี่ยถ่วงน้ำหนักกับของเดิม)
-    // หมายเหตุ: ต้องมีตาราง technicians คอลัมน์ id, rating, jobs_done (ดูหมายเหตุท้ายไฟล์)
+    // อัปเดตคะแนนสะสมของช่าง + บันทึกรีวิว — เดิม .select()/.update() ตาราง technicians และ
+    // .insert() ตาราง reviews ตรงๆ ทั้งคู่ โดน RLS บล็อกเงียบๆ เหมือนจุดอื่น (ฝั่งลูกค้าเป็น anon
+    // role) คะแนนช่างเลยไม่เคยขยับจริง เปลี่ยนมาเรียก submitJobReview() RPC ตัวเดียว ซึ่งฝั่ง
+    // server คำนวณ weighted average และอัปเดต technicians.rating + insert reviews ให้ในทรานแซคชัน
+    // เดียวกันอยู่แล้ว (ดู dtc-api.ts) ไม่ต้องคำนวณเองฝั่ง client อีกต่อไป
     try {
-      const { data: techRow, error: fetchErr } = await supabase
-        .from('technicians')
-        .select('rating, jobs_done')
-        .eq('id', assignedTech.id)
-        .single();
-
-      if (!fetchErr && techRow) {
-        // ฝั่งช่างจะเพิ่ม jobs_done ไปแล้ว 1 ตอนกดจบงาน (advanceJob) ก่อนหน้านี้
-        // ดังนั้นจำนวนงาน "ก่อนงานนี้" คือ jobs_done - 1
-        const jobsBeforeThisOne = Math.max(0, (techRow.jobs_done ?? assignedTech.jobs) - 1);
-        const prevRating = techRow.rating ?? assignedTech.rating;
-        const totalJobs = jobsBeforeThisOne + 1;
-        const newAverage = (prevRating * jobsBeforeThisOne + rating) / totalJobs;
-
-        await supabase
-          .from('technicians')
-          .update({ rating: Number(newAverage.toFixed(2)) })
-          .eq('id', assignedTech.id);
-      }
-
-      // เก็บรีวิวไว้เป็นประวัติ (ถ้ามีตาราง reviews) — ทำแบบ best-effort ไม่ให้ล้มทั้งฟังก์ชันถ้ายังไม่มีตารางนี้
       if (currentJobId) {
-        await supabase.from('reviews').insert([
-          { job_id: currentJobId, tech_id: assignedTech.id, rating, text: reviewText },
-        ]);
+        await submitJobReview({
+          jobId: currentJobId,
+          techId: assignedTech.id,
+          rating,
+          text: reviewText,
+        });
       }
     } catch (err) {
       console.error('Error updating technician rating / saving review:', err);
@@ -1162,6 +1233,21 @@ export default function App() {
     };
   }, []);
 
+  // ออกจากหน้าโลโก้แรก: ไปหน้า onboarding ตามปกติเสมอ (step 2) — ปิดแอปแล้วเปิดใหม่ต้อง
+  // ล็อกอินซ้ำทุกครั้ง ไม่ข้ามไปหน้า Home อัตโนมัติ (บัญชีที่เคยสมัครไว้ยังใช้ล็อกอินได้ตามปกติ
+  // เพราะข้อมูลบัญชี email+password ถูกเก็บแยกไว้ต่างหาก ดู getStoredAccounts/handleLoginSubmit)
+  const goPastSplash = () => {
+    setStep(2);
+  };
+
+  // หน้าโลโก้แรก (step 1): เปลี่ยนไปหน้าถัดไปเองอัตโนมัติหลังจาก 5 วินาที
+  useEffect(() => {
+    if (step === 1) {
+      const splashTimer = setTimeout(goPastSplash, 5000);
+      return () => clearTimeout(splashTimer);
+    }
+  }, [step]);
+
   useEffect(() => {
     if (step === 9 && !expandedBannerUrl) {
       const bannerTimer = setInterval(() => {
@@ -1178,11 +1264,14 @@ export default function App() {
   // loading / delivering / completed ที่ช่างกดจริงในแอปช่าง) จึงลบตัวจับเวลาจำลองออก
 
   useEffect(() => {
-    let basePrice = towingRequest.towType === 'รถสไลด์ (Slide Tow)' ? 1500 : 1200;
+    const issueConfig = ISSUE_SERVICE_CONFIG[towingRequest.selectedIssue] ?? { requiresTow: true };
+    let basePrice = issueConfig.requiresTow
+      ? (towingRequest.towType === 'รถสไลด์ (Slide Tow)' ? 1500 : 1200)
+      : (issueConfig.basePrice ?? 400);
     if (towingRequest.carCategory.includes('ไฟฟ้า')) basePrice += 300;
     const finalPrice = basePrice + Math.round(towingRequest.distanceKm * 50);
     setTowingRequest(prev => ({ ...prev, calculatedEtvPrice: finalPrice }));
-  }, [towingRequest.towType, towingRequest.carCategory, towingRequest.distanceKm]);
+  }, [towingRequest.selectedIssue, towingRequest.towType, towingRequest.carCategory, towingRequest.distanceKm]);
 
   const getUserDisplayName = () => {
     if (registerForm.name.trim()) return registerForm.name;
@@ -1199,19 +1288,121 @@ export default function App() {
     if (field === 'carNumber' && value.trim()) setRegCarNoErr(false);
   };
 
-  const handleRegisterSubmit = () => {
+  // ⚠️ LEGACY: เดิมฟังก์ชันคู่นี้เป็นแหล่งข้อมูลจริงของระบบสมาชิก (register/login เทียบกับ
+  // localStorage ตรง ๆ) — ปัญหาคือลบแอปแล้วลงใหม่ localStorage หายหมด บัญชีเลยหายไปด้วย
+  // ทั้งที่จริงยังสมัครไว้อยู่ ตอนนี้ handleRegisterSubmit / handleLoginSubmit เปลี่ยนไปใช้
+  // registerCustomer() / signInCustomer() (Supabase Auth จริง) แล้ว บัญชีจึงอยู่ถาวรฝั่ง
+  // server ไม่หายแม้ลบแอป — ฟังก์ชันคู่นี้เหลือไว้ให้ "หน้าลืมรหัสผ่าน (OTP)" ด้านล่างใช้
+  // เท่านั้น ซึ่งยังเป็น mock (สุ่ม OTP โชว์บนจอเอง ไม่ได้ส่งจริง) ไม่ได้ผูกกับรหัสผ่านจริง
+  // ใน Supabase — ถ้าจะทำระบบลืมรหัสผ่านให้ใช้งานได้จริง ต้องแยกทำต่างหากผ่าน
+  // supabase.auth.resetPasswordForEmail() (ส่งอีเมลจริง ไม่ใช่ scope ของการแก้ครั้งนี้)
+  type StoredAccount = {
+    name: string;
+    surname: string;
+    phoneNumber: string;
+    email: string;
+    password: string;
+  };
+
+  const getStoredAccounts = (): StoredAccount[] => {
+    try {
+      const raw = typeof window !== 'undefined' ? localStorage.getItem('dtc_customer_accounts') : null;
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+
+  const saveStoredAccounts = (accounts: StoredAccount[]) => {
+    try {
+      localStorage.setItem('dtc_customer_accounts', JSON.stringify(accounts));
+    } catch {
+      // localStorage ใช้ไม่ได้ (โหมด private/incognito) — ข้ามไป ไม่กระทบการใช้งานหลัก
+    }
+  };
+
+  // สมัครสมาชิกจริงผ่าน Supabase Auth (registerCustomer) แทนที่การเขียนบัญชีลง
+  // localStorage เดิม — เดิมลบแอปแล้วลงใหม่คือข้อมูลหายหมด เพราะไม่เคยไปอยู่ที่ฝั่ง
+  // server เลย ตอนนี้บัญชีจะอยู่ถาวรใน Supabase ไม่ว่าจะลบ/ลงแอปใหม่กี่รอบก็ล็อกอินได้เหมือนเดิม
+  const handleRegisterSubmit = async () => {
     let hasError = false;
+    setRegEmailErrMsg('');
+    setRegPasswordErr('');
+    setRegConfirmPasswordErr('');
+
     if (!registerForm.name.trim()) { setRegNameErr(true); hasError = true; }
     if (!registerForm.surname.trim()) { setRegSurnameErr(true); hasError = true; }
     if (!registerForm.phoneNumber.trim()) { setRegPhoneErr(true); hasError = true; }
     if (!registerForm.email.trim()) { setRegEmailErr(true); hasError = true; }
-    if (!registerForm.carNumber.trim()) { setRegCarNoErr(true); hasError = true; }
+
+    if (!regPassword.trim()) {
+      setRegPasswordErr('กรุณาตั้งรหัสผ่าน');
+      hasError = true;
+    } else if (!regPasswordChecks.length || !regPasswordChecks.uppercase || !regPasswordChecks.numberSpecial) {
+      setRegPasswordErr('รหัสผ่านไม่ตรงตามเงื่อนไขที่กำหนด');
+      hasError = true;
+    }
+
+    if (!regConfirmPassword.trim()) {
+      setRegConfirmPasswordErr('กรุณายืนยันรหัสผ่าน');
+      hasError = true;
+    } else if (regPassword.trim() && regConfirmPassword !== regPassword) {
+      setRegConfirmPasswordErr('รหัสผ่านไม่ตรงกัน');
+      hasError = true;
+    }
 
     if (hasError) return;
-    setStep(9);
+
+    setAuthSubmitting(true);
+    try {
+      // กันเคส request ค้างไม่ตอบเลย (เช่น env/URL ของ Supabase ผิด หรือเน็ตมือถือมีปัญหา)
+      // ไม่ให้ปุ่ม "กำลังสมัครสมาชิก..." ค้างตลอดไปแบบไม่มีวันจบ — ตั้ง timeout ไว้ 20 วิ
+      // (เผื่อเวลาให้พอสำหรับเน็ตมือถือช้าจริง ๆ ไม่ใช่แค่ debug ชั่วคราวแบบเดิม)
+      const profile = await Promise.race([
+        registerCustomer({
+          name: registerForm.name,
+          surname: registerForm.surname,
+          phone: registerForm.phoneNumber,
+          email: registerForm.email,
+          password: regPassword,
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('__TIMEOUT__')), 20000)
+        ),
+      ]);
+      setCustomerProfile(profile);
+
+      // เคลียร์ค่ารหัสผ่านที่พิมพ์ไว้ในฟอร์มออกจาก state ทันทีหลังสมัครสำเร็จ
+      setRegPassword('');
+      setRegConfirmPassword('');
+      setStep(9);
+    } catch (err: any) {
+      const msg: string = err?.message || '';
+
+      if (msg === '__TIMEOUT__') {
+        setAppToast({ message: 'เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ กรุณาตรวจสอบสัญญาณอินเทอร์เน็ตแล้วลองใหม่อีกครั้ง', type: 'error' });
+        setRegEmailErr(true);
+        setRegEmailErrMsg('เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง');
+        return;
+      }
+
+      // ข้อความจาก Supabase Auth ตอนอีเมลซ้ำมักจะมีคำว่า "already registered" /
+      // "already exists" ปนมา — เช็คแบบ loose ไว้กันเวอร์ชัน error message เปลี่ยน
+      if (/already/i.test(msg)) {
+        setRegEmailErr(true);
+        setRegEmailErrMsg('อีเมลนี้ถูกใช้สมัครสมาชิกไปแล้ว');
+      } else {
+        setRegEmailErr(true);
+        setRegEmailErrMsg(msg || 'สมัครสมาชิกไม่สำเร็จ กรุณาลองใหม่อีกครั้ง');
+      }
+    } finally {
+      setAuthSubmitting(false);
+    }
   };
 
-  const handleLoginSubmit = (e?: React.FormEvent) => {
+  const handleLoginSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     let hasError = false;
 
@@ -1229,19 +1420,52 @@ export default function App() {
       setPasswordError('');
     }
 
-    if (!hasError) {
+    if (hasError) return;
+
+    setAuthSubmitting(true);
+    try {
+      // กันเคส request ค้างไม่ตอบเลย (เช่น env/URL ของ Supabase ผิด หรือเน็ตมือถือมีปัญหา)
+      // ไม่ให้ปุ่ม "กำลังเข้าสู่ระบบ..." ค้างตลอดไปแบบไม่มีวันจบ — ตั้ง timeout ไว้ 20 วิ
+      const profile = await Promise.race([
+        signInCustomer(loginEmail.trim(), loginPassword),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('__TIMEOUT__')), 20000)
+        ),
+      ]);
+      setCustomerProfile(profile);
+      setRegisterForm(prev => ({
+        ...prev,
+        name: profile.name,
+        surname: profile.surname,
+        phoneNumber: profile.phone,
+        email: profile.email,
+      }));
       setStep(9);
+    } catch (err: any) {
+      const msg: string = err?.message || '';
+
+      if (msg === '__TIMEOUT__') {
+        setAppToast({ message: 'เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ กรุณาตรวจสอบสัญญาณอินเทอร์เน็ตแล้วลองใหม่อีกครั้ง', type: 'error' });
+        return;
+      }
+
+      // Supabase ไม่บอกแยกว่า "อีเมลไม่พบ" หรือ "รหัสผ่านผิด" (กันเดาอีเมลถูกจากข้อความ error)
+      // เลยแสดงข้อความรวมที่ช่องรหัสผ่านเหมือนกันทั้งสองกรณี
+      setEmailError(true);
+      setPasswordError('อีเมลหรือรหัสผ่านไม่ถูกต้อง หรือยังไม่เคยสมัครสมาชิก');
+    } finally {
+      setAuthSubmitting(false);
     }
   };
 
-  const handleGoogleSelect = () => {
-    setRegisterForm(prev => ({ ...prev, name: 'Google User', email: 'user.google@gmail.com' }));
-    setStep(9);
-  };
-
-  const handleAppleAuth = () => {
-    setRegisterForm(prev => ({ ...prev, name: 'Apple User', email: 'user.apple@icloud.com' }));
-    setStep(9);
+  // เดิมปุ่มนี้ปลอมโปรไฟล์ ('Line User' / 'user.line@line.me' เหมือนกันทุกคน) แล้วเด้ง
+  // เข้าแอปทันทีโดยไม่เคยสร้างบัญชีจริงใน Supabase เลย — ข้อมูลเลยอยู่แค่ใน React state
+  // ของเครื่องนั้น พอถอนแอปแล้วลงใหม่จึงหายหมดต้องสมัครใหม่ทุกครั้ง (ต่างจากฝั่งช่างที่
+  // ปุ่มนี้ยังไม่ผูก OAuth จริงเหมือนกัน แต่บอกผู้ใช้ตรงๆ ว่ายังไม่เปิดใช้งาน แทนที่จะ
+  // แกล้งล็อกอินให้เข้าได้) — ยังไม่มีการต่อ LINE Login API จริงในระบบนี้ เปลี่ยนเป็นขึ้น
+  // toast บอกตรงๆ แบบเดียวกับฝั่งช่างแทน จนกว่าจะทำ LINE OAuth จริงแล้วผูกกับ Supabase Auth
+  const handleLineSelect = () => {
+    setAppToast({ message: 'ฟีเจอร์นี้ยังไม่เปิดใช้งาน กรุณาสมัครสมาชิกด้วยอีเมลไปก่อน', type: 'error' });
   };
 
   const handleSendCode = () => {
@@ -1306,13 +1530,24 @@ export default function App() {
     }
 
     if (!hasError) {
+      // บันทึกรหัสผ่านใหม่ลงบัญชีจริง (หาโดยจับคู่ email หรือเบอร์โทรที่กรอกไว้ตอนขอรีเซ็ต)
+      const accounts = getStoredAccounts();
+      const contactTrimmed = resetContact.trim().toLowerCase();
+      const idx = accounts.findIndex(
+        a => a.email.trim().toLowerCase() === contactTrimmed || a.phoneNumber.trim() === resetContact.trim()
+      );
+      if (idx !== -1) {
+        accounts[idx] = { ...accounts[idx], password: newPasswordVal };
+        saveStoredAccounts(accounts);
+      }
       setShowResetSuccessModal(true);
     }
   };
 
   const handleSuccessModalClose = () => {
     setShowResetSuccessModal(false);
-    setLoginPassword(newPasswordVal);
+    // ไม่กรอกรหัสผ่านใหม่ใส่ช่องล็อกอินให้อัตโนมัติ — ให้ลูกค้าพิมพ์เข้าไปเองตอนล็อกอินจริง
+    setLoginPassword('');
     setNewPasswordVal('');
     setConfirmPasswordVal('');
     setAuthTab('login');
@@ -1324,10 +1559,20 @@ const handleConfirmTowingBooking = async () => {
       return;
     }
 
+    // บังคับแนบสลิปก่อนเสมอถ้าเลือกจ่ายผ่าน PromptPay/QR Code — กันปัญหาช่างไปถึงหน้างานแล้ว
+    // ไม่มีหลักฐานการโอนให้ตรวจสอบเลย (เดิมแนบหรือไม่แนบก็เรียกรถได้เหมือนกัน)
+    if (selectedPaymentMethod === 'promptpay' && !slipFile) {
+      setAppToast({ message: 'กรุณาแนบสลิปการโอนเงินก่อนเรียกช่าง', type: 'error' });
+      return;
+    }
+
     try {
       // เดิม insert ตรงเข้า 'jobs' และส่ง price เอง (towingRequest.calculatedEtvPrice)
       // เปลี่ยนเป็นเรียก createJobApi() แทน — ราคาคำนวณฝั่ง server เสมอ ดู
       // supabase/migrations/0002_price_and_status_rpc.sql
+      // requiredSpecialty: ส่งไปให้ backend รู้ว่างานนี้ต้องแมทช์ช่างประเภทไหน
+      // ('tow' = ต้องใช้รถลาก/สไลด์ ตาม towType, 'jump_start'/'tire_change' = ช่างเฉพาะทาง ไม่ต้องลากรถ)
+      // *ต้องอัปเดต create_job_priced RPC ให้รับ p_required_specialty ด้วย ไม่งั้นค่านี้จะถูก DB เพิกเฉย*
       const data = await createJobApi({
         customerName: getUserDisplayName(),
         customerPhone: registerForm.phoneNumber,
@@ -1336,6 +1581,7 @@ const handleConfirmTowingBooking = async () => {
         carPlate: registerForm.carNumber,
         issueType: towingRequest.selectedIssue,
         towType: towingRequest.towType,
+        requiredSpecialty: currentIssueConfig.requiresTow ? 'tow' : (currentIssueConfig.specialty ?? 'tow'),
         carCategory: towingRequest.carCategory,
         locationLat: liveCoords.lat,
         locationLng: liveCoords.lng,
@@ -1346,99 +1592,279 @@ const handleConfirmTowingBooking = async () => {
         distanceKm: towingRequest.distanceKm,
       });
 
-      if (data) {
+      // เดิม setIsBookingSuccess(true) อยู่นอก if (data) เลยขึ้นหน้า "ส่งคำขอสำเร็จ"
+      // เสมอแม้ RPC จะไม่ได้สร้างงานจริงในฐานข้อมูล (ไม่ throw error แต่ data/data.id
+      // ว่างเปล่า) — ย้ายเข้ามาไว้ใน if (data && data.id) ให้ตรงกับผลจริง และโชว์ error
+      // ชัดๆ ถ้า RPC สำเร็จ (ไม่ throw) แต่ไม่ได้คืน job จริงมาให้
+      if (data && data.id) {
         setCurrentJobId(data.id);
         // บันทึกวิธีชำระเงินที่ลูกค้าเลือกไว้เสมอ (ไม่ await เพื่อไม่ให้ลูกค้ารอ — หน้า
         // "ส่งคำขอสำเร็จ" ขึ้นได้ทันที ส่วนบันทึก/อัปโหลดสลิปทำงานเบื้องหลัง)
         submitPaymentRecord(data.id);
-      }
 
-      const estimatedMinutes = Math.max(8, Math.min(30, Math.round(towingRequest.distanceKm * 2) + 8));
-      setEtaTotalMinutes(estimatedMinutes);
-      setIsBookingSuccess(true);
-      setHasActiveBooking(true);
-      setTechAccepted(false); // ยังไม่มีช่างรับงาน ห้ามเปิดหน้าแมพจนกว่าจะได้รับสถานะ 'accepted' จริงจาก Supabase
-      setTruckProgress(15);
-      setTrackingPhase('moving_to_red');
-
-      // แสดงหน้า "ส่งคำขอสำเร็จ" สั้นๆ แล้วพาไปแท็บกิจกรรม แต่ "ยังไม่" เปิดแผนที่ —
-      // แผนที่ (showTrackingDetail) จะเปิดก็ต่อเมื่อช่างกดรับงานจริงเท่านั้น (ดู useEffect ดักฟัง Supabase ด้านล่าง)
-      setTimeout(() => {
-        setIsBookingSuccess(false);
-        setActiveTab('activity');
-      }, 2500);
-
-    } catch (err: any) {
-      console.error('Error creating booking:', err);
-      setAppToast({ message: 'เกิดข้อผิดพลาดในการส่งข้อมูล กรุณาลองใหม่อีกครั้ง', type: 'error' });
-    }
-  };
-
-  // 1. ดักฟังเมื่อช่างฝั่ง t3 กดรับงาน
-  // เดิมเปิด supabase.channel(...) เอง เปลี่ยนมาใช้ subscribeJob() จาก lib/dtc-api.ts
-  // แทน (logic ข้างในเหมือนเดิมทุกอย่าง แค่ตัวแปรที่รับข้อมูลงานเปลี่ยนชื่อ)
-  useEffect(() => {
-    if (!currentJobId) return;
-
-    const unsubscribe = subscribeJob(currentJobId, (job) => {
-      const jobStatus = job.status;
-
-      if (jobStatus === 'accepted' && !techAccepted) {
-        // ช่างกดรับงานจริง ๆ แล้วเท่านั้น ถึงจะพาไปหน้าแมพ — นี่คือจุดเดียวที่เปิด showTrackingDetail
-        setAssignedTech({
-          id: job.assignedTechId || mockAssignedTech.id,
-          name: job.assignedTechName || mockAssignedTech.name,
-          phone: job.assignedTechPhone || mockAssignedTech.phone,
-          rating: job.assignedTechRating ?? mockAssignedTech.rating,
-          jobs: job.assignedTechJobs ?? mockAssignedTech.jobs,
-          plateNumber: job.assignedTechPlate || mockAssignedTech.plateNumber,
-          photoUrl: mockAssignedTech.photoUrl,
-          status: 'working',
-        });
-        setTechAccepted(true);
-        setTrackingPhase('moving_to_red');
+        const estimatedMinutes = Math.max(8, Math.min(30, Math.round(towingRequest.distanceKm * 2) + 8));
+        setEtaTotalMinutes(estimatedMinutes);
+        setIsBookingSuccess(true);
+        setHasActiveBooking(true);
+        setTechAccepted(false); // ยังไม่มีช่างรับงาน ห้ามเปิดหน้าแมพจนกว่าจะได้รับสถานะ 'accepted' จริงจาก Supabase
         setTruckProgress(15);
-        setActiveTab('activity');
-        setShowTrackingDetail(true);
+        setTrackingPhase('moving_to_red');
+
+        // แสดงหน้า "ส่งคำขอสำเร็จ" สั้นๆ แล้วพาไปแท็บกิจกรรม แต่ "ยังไม่" เปิดแผนที่ —
+        // แผนที่ (showTrackingDetail) จะเปิดก็ต่อเมื่อช่างกดรับงานจริงเท่านั้น (ดู useEffect ดักฟัง Supabase ด้านล่าง)
+        setTimeout(() => {
+          setIsBookingSuccess(false);
+          setActiveTab('activity');
+        }, 2500);
+      } else {
         setAppToast({
-          message: `ช่าง ${job.assignedTechName || 'บริการ'} รับงานของคุณแล้ว กำลังเดินทางมาหา`,
-          type: 'success',
+          message: 'ส่งคำขอไม่สำเร็จ: ระบบไม่ได้สร้างงานจริง (create_job_priced ไม่คืนค่างานกลับมา) กรุณาลองใหม่หรือแจ้งทีมงาน',
+          type: 'error',
         });
         return;
       }
 
-      // สถานะถัดไปของงาน ที่ฝั่งช่าง (t3) เป็นคนกดอัปเดตจริงระหว่างทาง —
-      // แผนที่ฝั่งลูกค้าต้องขยับตามสถานะจริงเหล่านี้ ไม่ใช่ตัวจับเวลาจำลองอีกต่อไป
-      switch (jobStatus) {
-        case 'en_route':
-          setTrackingPhase('moving_to_red');
-          setTruckProgress(35);
-          break;
-        case 'arrived':
-          setTrackingPhase('loading');
-          setTruckProgress(50);
-          setAppToast({ message: 'ช่างถึงจุดเกิดเหตุแล้ว', type: 'success' });
-          break;
-        case 'loading':
-          setTrackingPhase('loading');
-          setTruckProgress(50);
-          setAppToast({ message: 'ช่างกำลังยกรถขึ้นรถสไลด์', type: 'success' });
-          break;
-        case 'delivering':
-          setTrackingPhase('moving_to_green');
-          setTruckProgress(75);
-          setAppToast({ message: 'ยกรถเสร็จแล้ว กำลังนำรถไปส่งที่อู่ปลายทาง', type: 'success' });
-          break;
-        case 'completed':
-          setTrackingPhase('completed');
-          setTruckProgress(100);
-          setShowReviewModal(true);
-          break;
-        default:
-          break;
-      }
-    });
+    } catch (err: any) {
+      console.error('Error creating booking:', err);
+      // โชว์ข้อความ error จริงจาก Supabase ในแอปเลย (ชั่วคราวเพื่อ debug บนเครื่องจริง
+      // ที่เปิด chrome://inspect ไม่ได้เพราะนโยบายองค์กรบล็อกไว้)
+      const detail = err?.message || err?.error_description || err?.hint || JSON.stringify(err);
+      setAppToast({ message: `ส่งข้อมูลไม่สำเร็จ: ${detail}`, type: 'error' });
+    }
+  };
 
+  // ดึงและติดตามสถานะการชำระเงินของงานปัจจุบันแบบเรียลไทม์ — เพื่อให้รู้ทันทีถ้าช่างกดปฏิเสธสลิป
+  // (rejected) จะได้ขึ้นแบนเนอร์เตือนพร้อมปุ่มแนบสลิปใหม่ แทนที่จะค้างไม่รู้อะไรเลย
+  //
+  // เดิมมีแค่ fetch ครั้งเดียว + realtime subscribe เท่านั้น ไม่มี poll สำรองเหมือนจุดอื่นในไฟล์นี้
+  // (เทียบ fetchMessages ด้านล่างที่มี pollInterval สำรองไว้อยู่แล้ว เพราะ Supabase Realtime
+  // WebSocket หลุดเงียบๆ ได้บ่อยบนมือถือเวลาแอปถูกย่อ/ล็อกจอ/สลับแอป แล้วไม่ reconnect เอง)
+  // ผลคือถ้า WebSocket หลุดตอนช่างกดปฏิเสธสลิปพอดี ฝั่งลูกค้าจะไม่มีทางรู้เลยว่า status
+  // เปลี่ยนเป็น rejected แล้ว จนกว่าจะรีโหลดแอปทั้งหน้า (banner เลยไม่ขึ้นทั้งที่ DB อัปเดตถูกต้อง) —
+  // เพิ่ม poll ทุก 4 วิ เป็นตัวสำรอง ให้ sync กลับมาเองได้แม้ realtime หลุด
+  useEffect(() => {
+    if (!currentJobId) {
+      setMyPayment(null);
+      return;
+    }
+
+    const fetchMyPayment = async () => {
+      const { data, error } = await supabase
+        .from('payments')
+        .select('*')
+        .eq('job_id', currentJobId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!error && data) {
+        setMyPayment({
+          id: data.id,
+          slip_url: data.slip_url,
+          amount: data.amount,
+          payment_method: data.payment_method === 'cash' || data.payment_method === 'credit' ? data.payment_method : 'transfer',
+          status: data.status,
+        });
+      }
+    };
+
+    fetchMyPayment();
+
+    const myPaymentChannel = supabase
+      .channel(`my_payment_${currentJobId}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'payments', filter: `job_id=eq.${currentJobId}` },
+        (payload) => {
+          const row: any = payload.new;
+          if (!row) return;
+          setMyPayment({
+            id: row.id,
+            slip_url: row.slip_url,
+            amount: row.amount,
+            payment_method: row.payment_method === 'cash' || row.payment_method === 'credit' ? row.payment_method : 'transfer',
+            status: row.status,
+          });
+        }
+      )
+      .subscribe();
+
+    // poll สำรอง เผื่อ realtime หลุดเงียบๆ — ทำงานคู่ขนานกับ subscribe ด้านบน ไม่ทดแทนกัน
+    const myPaymentPollInterval = setInterval(fetchMyPayment, 4000);
+
+    return () => {
+      supabase.removeChannel(myPaymentChannel);
+      clearInterval(myPaymentPollInterval);
+    };
+  }, [currentJobId]);
+
+  // ลูกค้าแนบสลิปใหม่หลังช่างปฏิเสธสลิปเดิม — อัปโหลดไฟล์ใหม่ทับที่ bucket เดิม แล้วอัปเดต
+  // แถวเดิมในตาราง payments (ไม่สร้างแถวใหม่ เพื่อให้ประวัติการปฏิเสธ/ยืนยันอยู่ที่แถวเดียวกัน)
+  // สถานะกลับไปเป็น 'pending' ให้ช่างตรวจสอบใหม่อีกครั้ง
+  // รายงานปัญหา/ร้องเรียนงานที่จบไปแล้ว — ยังไม่มีตาราง dispute หรือแอปแอดมินแยกต่างหากในระบบนี้
+  // เลยส่งเป็นข้อความพิเศษ (คำนำหน้า [REPORT]) เข้าแชตของงานนั้นแทน — ใช้ได้เฉพาะงานที่มี job_id
+  // จริงจาก Supabase เท่านั้น (รายการประวัติเก่าที่เป็นข้อมูลตัวอย่าง เช่น 'JOB-20260210' จะ insert
+  // ไม่ผ่านเพราะไม่ตรงกับ job จริงในระบบ — ครอบ try/catch ไว้กันแอปพังถ้าเจอกรณีนี้)
+  const handleReportServiceIssue = async (jobId: string) => {
+    const reason = window.prompt('อธิบายปัญหาที่พบกับงานนี้สั้นๆ (เช่น ช่างมาช้าผิดปกติ, พฤติกรรมไม่เหมาะสม):');
+    if (!reason || !reason.trim()) return;
+    try {
+      await sendChatMessage({ jobId, sender: 'customer', text: `[REPORT] ลูกค้ารายงานปัญหา: ${reason.trim()}` });
+      setAppToast({ message: 'ส่งรายงานปัญหาแล้ว ทีมงานจะตรวจสอบให้', type: 'success' });
+    } catch (err) {
+      console.error('Error reporting job issue:', err);
+      setAppToast({ message: 'ส่งรายงานไม่สำเร็จ (งานนี้อาจเป็นข้อมูลเก่าที่ไม่มีอยู่ในระบบแล้ว)', type: 'error' });
+    }
+  };
+
+  // แก้ให้เขียนผ่าน RPC ทั้งคู่ (recordJobPayment / sendChatMessage) แทนการ .update()/.insert()
+  // ตรงเข้าตาราง — เดิมโดน RLS บล็อกเงียบๆ ทั้งคู่ (ดูคอมเมนต์ตอน import ด้านบนไฟล์) ทำให้
+  // status ไม่เคยเปลี่ยนเป็น 'pending' จริงใน DB และข้อความแจ้งช่างก็ไม่เคยถูกบันทึกจริงเลย
+  // แม้ toast จะขึ้นว่า "สำเร็จ" ก็ตาม (เพราะ error ถูกกลืนไปแค่ console.error)
+  const handleReuploadSlip = async () => {
+    if (!reslipFile || !myPayment || !currentJobId) return;
+    setIsReuploadingSlip(true);
+    try {
+      const fileExt = reslipFile.name.split('.').pop() || 'jpg';
+      const filePath = `${myPayment.id}-reupload-${Date.now()}.${fileExt}`;
+      const { error: uploadError } = await supabase.storage
+        .from('payment-slips')
+        .upload(filePath, reslipFile, { upsert: false });
+      if (uploadError) throw uploadError;
+
+      const { data: publicUrlData } = supabase.storage.from('payment-slips').getPublicUrl(filePath);
+
+      // record_job_payment เป็น RPC เดียวกับตอนจองงาน (upsert ทับแถวเดิมของ job นี้ ไม่สร้างแถวใหม่)
+      // ต้องส่ง amount เดิมกลับไปด้วยเสมอ ไม่งั้นค่าฝั่ง server อาจถูกเขียนทับด้วยค่าว่าง/ผิดยอด
+      await recordJobPayment({
+        jobId: currentJobId,
+        amount: myPayment.amount ?? 0,
+        paymentMethod: 'promptpay',
+        slipUrl: publicUrlData.publicUrl,
+      });
+
+      setMyPayment((prev) => (prev ? { ...prev, slip_url: publicUrlData.publicUrl, status: 'pending' } : prev));
+      setReslipFile(null);
+      if (reslipFileInputRef.current) reslipFileInputRef.current.value = '';
+      if (reslipChatFileInputRef.current) reslipChatFileInputRef.current.value = '';
+      setAppToast({ message: 'แนบสลิปใหม่เรียบร้อย รอช่างตรวจสอบอีกครั้ง', type: 'success' });
+
+      // แจ้งช่างเข้าแชทอัตโนมัติทันทีที่ส่งสลิปใหม่สำเร็จ พร้อมลิงก์สลิป — เดิมช่างไม่มีทางรู้เลยว่า
+      // ลูกค้าส่งสลิปใหม่มาหรือยัง นอกจากเปิดหน้ารายละเอียดงานเข้าไปเช็คเอง
+      const notifyText = `แนบสลิปโอนเงินใหม่แล้ว กรุณาตรวจสอบอีกครั้ง: ${publicUrlData.publicUrl}`;
+      setChatMessages((prev) => [...prev, { sender: 'user', text: notifyText }]);
+      try {
+        await sendChatMessage({ jobId: currentJobId, sender: 'customer', text: notifyText });
+      } catch (chatErr) {
+        console.error('Error notifying tech about new slip:', chatErr);
+      }
+    } catch (err) {
+      console.error('Error re-uploading payment slip:', err);
+      setAppToast({ message: 'แนบสลิปใหม่ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง', type: 'error' });
+    } finally {
+      setIsReuploadingSlip(false);
+    }
+  };
+
+  // 1. ดักฟังเมื่อช่างฝั่ง t3 กดรับงาน / อัปเดตสถานะงานระหว่างทาง
+  // เดิมเปิด supabase.channel(...) เอง เปลี่ยนมาใช้ subscribeJob() จาก lib/dtc-api.ts แทน
+  //
+  // applyJobStatus คือ logic กลางที่ใช้ทั้ง 2 ทาง:
+  //  (a) ตอนเปิดหน้า/ได้ currentJobId มาใหม่ — ดึงสถานะจริงจาก DB ด้วย getJob() ทันที (silent = true,
+  //      ไม่ต้องเด้ง toast ย้อนหลังสำหรับ event ที่พลาดไปแล้ว)
+  //  (b) ตอนมี Realtime event ใหม่เข้ามาจริงๆ ระหว่างที่หน้าเปิดอยู่ (silent = false, เด้ง toast ปกติ)
+  //
+  // เหตุผลที่ต้องมี (a): Supabase Realtime ส่งเฉพาะ event ที่เกิด "หลังจาก" channel
+  // subscribe เสร็จเท่านั้น (เป็นสตรีมสด ไม่ใช่คิวเก็บของเก่า) ถ้าช่างกดรับงาน+เปลี่ยนสถานะเร็ว
+  // กว่าที่ channel ฝั่งลูกค้าจะพร้อม เหตุการณ์ตรงกลาง (เช่น 'accepted') จะหลุดหายไปเลย ทำให้
+  // techAccepted ไม่เคยถูกตั้งเป็น true และการ์ด "กำลังหาช่าง..." ค้างอยู่ทั้งที่งานอาจจบไปแล้ว
+  const applyJobStatus = (job: TowJob, opts: { silent?: boolean } = {}) => {
+    const jobStatus = job.status;
+    const silent = opts.silent ?? false;
+
+    // ครอบคลุมทุกสถานะตั้งแต่ 'accepted' เป็นต้นไป ไม่ใช่แค่ดักจับ event 'accepted' แบบเป๊ะๆ
+    // เผื่อกรณีพลาด 'accepted' ไปแล้วมาเจอ en_route/arrived/... เป็นสถานะแรกที่ได้รับแทน
+    const techIsEngaged = jobStatus !== 'pending' && jobStatus !== 'cancelled';
+    if (techIsEngaged && !techAccepted) {
+      setAssignedTech({
+        id: job.assignedTechId || mockAssignedTech.id,
+        name: job.assignedTechName || mockAssignedTech.name,
+        phone: job.assignedTechPhone || mockAssignedTech.phone,
+        rating: job.assignedTechRating ?? mockAssignedTech.rating,
+        jobs: job.assignedTechJobs ?? mockAssignedTech.jobs,
+        plateNumber: job.assignedTechPlate || mockAssignedTech.plateNumber,
+        photoUrl: mockAssignedTech.photoUrl,
+        status: 'working',
+      });
+      setTechAccepted(true);
+      setActiveTab('activity');
+      setShowTrackingDetail(true);
+      if (!silent) {
+        setAppToast({
+          message: `ช่าง ${job.assignedTechName || 'บริการ'} รับงานของคุณแล้ว กำลังเดินทางมาหา`,
+          type: 'success',
+        });
+      }
+    }
+
+    // สถานะถัดไปของงาน ที่ฝั่งช่าง (t3) เป็นคนกดอัปเดตจริงระหว่างทาง —
+    // แผนที่ฝั่งลูกค้าต้องขยับตามสถานะจริงเหล่านี้ ไม่ใช่ตัวจับเวลาจำลองอีกต่อไป
+    switch (jobStatus) {
+      case 'accepted':
+        setTrackingPhase('moving_to_red');
+        setTruckProgress(15);
+        break;
+      case 'en_route':
+        setTrackingPhase('moving_to_red');
+        setTruckProgress(35);
+        break;
+      case 'arrived':
+        setTrackingPhase(currentIssueConfig.requiresTow ? 'loading' : 'on_site');
+        setTruckProgress(50);
+        if (!silent) setAppToast({ message: 'ช่างถึงจุดเกิดเหตุแล้ว', type: 'success' });
+        break;
+      case 'loading':
+        setTrackingPhase('loading');
+        setTruckProgress(50);
+        if (!silent) setAppToast({ message: 'ช่างกำลังยกรถขึ้นรถสไลด์', type: 'success' });
+        break;
+      case 'delivering':
+        setTrackingPhase('moving_to_green');
+        setTruckProgress(75);
+        if (!silent) setAppToast({ message: 'ยกรถเสร็จแล้ว กำลังนำรถไปส่งที่อู่ปลายทาง', type: 'success' });
+        break;
+      case 'completed':
+        setTrackingPhase('completed');
+        setTruckProgress(100);
+        setShowReviewModal(true);
+        break;
+      default:
+        break;
+    }
+  };
+
+  // 1a. ดึงสถานะจริงจาก DB ทันทีตอนได้ currentJobId มา (เปิดหน้า/รีเฟรช/กลับมาจากพื้นหลัง)
+  // เพื่อไม่ให้พลาด event ที่เกิดขึ้นก่อน Realtime channel จะเชื่อมต่อเสร็จ
+  useEffect(() => {
+    if (!currentJobId) return;
+    let cancelled = false;
+    getJob(currentJobId)
+      .then((job) => {
+        if (!cancelled && job) applyJobStatus(job, { silent: true });
+      })
+      .catch((err) => {
+        console.error('Error fetching current job status:', err);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentJobId]);
+
+  // 1b. ดักฟังอัปเดตสดต่อจากนั้นด้วย Realtime
+  useEffect(() => {
+    if (!currentJobId) return;
+    const unsubscribe = subscribeJob(currentJobId, (job) => applyJobStatus(job, { silent: false }));
     return unsubscribe;
   }, [currentJobId, techAccepted]);
 
@@ -1501,10 +1927,18 @@ const handleConfirmTowingBooking = async () => {
         .order('created_at', { ascending: true });
 
       if (data) {
-        setChatMessages(data.map(m => ({
+        const mapped: { sender: 'user' | 'tech'; text: string }[] = data.map(m => ({
           sender: m.sender === 'customer' ? 'user' : 'tech',
           text: m.text
-        })));
+        }));
+        // ใช้ functional update เทียบจำนวนข้อความเดิม เผื่อข้อความใหม่มาจาก poll (ไม่ใช่ realtime)
+        // จะได้ติดจุดแดงแจ้งเตือนถูกต้องแม้ Realtime มาช้า/หลุดไปเลย
+        setChatMessages((prev) => {
+          if (mapped.length > prev.length && !isChatOpenRef.current) {
+            setHasUnreadChat(true);
+          }
+          return mapped;
+        });
       }
     };
 
@@ -1534,8 +1968,13 @@ const handleConfirmTowingBooking = async () => {
       )
       .subscribe();
 
+    // Poll สำรองทุก 3 วิ คู่กับ Realtime — เผื่อ Realtime มาช้า/หลุด ข้อความจะไม่มีทางช้าเกิน 3 วิ
+    // (fetchMessages ดึงมาทั้งชุดทับของเดิมเสมอ จึงไม่มีปัญหาข้อความซ้ำ)
+    const pollInterval = setInterval(fetchMessages, 3000);
+
     return () => {
       supabase.removeChannel(chatChannel);
+      clearInterval(pollInterval);
     };
   }, [currentJobId]);
 
@@ -1586,75 +2025,22 @@ const handleConfirmTowingBooking = async () => {
     { id: 'อื่นๆ', label: 'อื่นๆ', icon: AlertTriangle },
   ];
 
-  // ขอบเขตแผนที่ (bbox) คำนวณสดจากจุดที่มีจริง: จุดเกิดเหตุ (liveCoords), อู่ปลายทาง (nearestGarage), ตำแหน่งช่างจริง (techLiveCoords)
-  // แทน bbox แบบ hardcode เดิมที่ตรึงไว้แถวใจกลางกรุงเทพฯ ไม่ว่าจริงๆ งานจะเกิดที่ไหนก็ตาม
-  const getMapBounds = () => {
-    const points = [
-      liveCoords,
-      towingRequest.nearestGarageLat != null && towingRequest.nearestGarageLng != null
-        ? { lat: towingRequest.nearestGarageLat, lng: towingRequest.nearestGarageLng }
-        : null,
-      techLiveCoords,
-    ].filter((p): p is { lat: number; lng: number } => p != null);
-
-    if (points.length === 0) {
-      // ยังไม่มีพิกัดอะไรเลย ใช้ใจกลางกรุงเทพฯ เป็นค่าเริ่มต้น
-      return { minLat: 13.72, maxLat: 13.77, minLng: 100.54, maxLng: 100.58 };
-    }
-
-    const lats = points.map((p) => p.lat);
-    const lngs = points.map((p) => p.lng);
-    const rawMinLat = Math.min(...lats);
-    const rawMaxLat = Math.max(...lats);
-    const rawMinLng = Math.min(...lngs);
-    const rawMaxLng = Math.max(...lngs);
-
-    // เผื่อ padding รอบขอบ ~25% ของช่วงจริง และบังคับช่วงขั้นต่ำไว้กันจุดเดียวแล้ว bbox แคบจนแผนที่ซูมเกินไป
-    const latSpan = Math.max(rawMaxLat - rawMinLat, 0.01);
-    const lngSpan = Math.max(rawMaxLng - rawMinLng, 0.01);
-    const latPad = latSpan * 0.35;
-    const lngPad = lngSpan * 0.35;
-
-    return {
-      minLat: rawMinLat - latPad,
-      maxLat: rawMaxLat + latPad,
-      minLng: rawMinLng - lngPad,
-      maxLng: rawMaxLng + lngPad,
-    };
+  // อาการไหนไม่ต้องใช้รถลาก/สไลด์ (ราคาถูกกว่า และต้องแมทช์ช่างเฉพาะทาง แทนช่างรถลาก)
+  // requiresTow: true ใช้ตัวเลือกรถสไลด์/รถยกแบบเดิม, false ใช้ specialty + basePrice ด้านล่างแทน
+  const ISSUE_SERVICE_CONFIG: Record<string, { requiresTow: boolean; specialty?: string; label?: string; basePrice?: number }> = {
+    'รถเสีย': { requiresTow: true },
+    'แบตหมด': { requiresTow: false, specialty: 'jump_start', label: 'บริการพ่วงแบตเตอรี่', basePrice: 400 },
+    'ยางแตก': { requiresTow: false, specialty: 'tire_change', label: 'บริการเปลี่ยน/ปะยาง', basePrice: 350 },
+    'อื่นๆ': { requiresTow: true },
   };
+  const currentIssueConfig = ISSUE_SERVICE_CONFIG[towingRequest.selectedIssue] ?? { requiresTow: true };
 
-  // แปลงพิกัด lat/lng จริง เป็นตำแหน่งเปอร์เซ็นต์ top/left บนกรอบแผนที่ ตาม bbox ที่คำนวณไว้
-  const coordsToPercent = (lat: number, lng: number, bounds: { minLat: number; maxLat: number; minLng: number; maxLng: number }) => {
-    const top = ((bounds.maxLat - lat) / (bounds.maxLat - bounds.minLat)) * 100;
-    const left = ((lng - bounds.minLng) / (bounds.maxLng - bounds.minLng)) * 100;
-    return {
-      top: Math.max(6, Math.min(94, top)),
-      left: Math.max(6, Math.min(94, left)),
-    };
-  };
-
-  const getTruckPosition = () => {
-    // มีพิกัด GPS จริงของช่างแล้ว — ใช้ตำแหน่งจริงเลย แม่นกว่าตัวเลขจำลอง
-    if (techLiveCoords) {
-      return coordsToPercent(techLiveCoords.lat, techLiveCoords.lng, getMapBounds());
-    }
-    // ยังไม่มีพิกัดจริงส่งเข้ามา (ช่างเพิ่งรับงาน ยังไม่ทัน GPS ping แรก) — ใช้ตำแหน่งจำลองไปพลางก่อน
-    if (trackingPhase === 'moving_to_red' || trackingPhase === 'loading') {
-      const factor = (truckProgress - 15) / 35;
-      const clampedFactor = Math.max(0, Math.min(1, factor));
-      return {
-        top: 15 + clampedFactor * (50 - 15),
-        left: 15 + clampedFactor * (50 - 15),
-      };
-    } else {
-      const factor = (truckProgress - 50) / 50;
-      const clampedFactor = Math.max(0, Math.min(1, factor));
-      return {
-        top: 50 + clampedFactor * (25 - 50),
-        left: 50 + clampedFactor * (80 - 50),
-      };
-    }
-  };
+  // ขอบเขตแผนที่ (bbox) เดิมที่คำนวณเองเทียบ % สำหรับ overlay หมุดบน iframe static ถูกลบออก
+  // ทั้งหมดแล้ว — ย้ายไปให้ Leaflet (components/LiveTrackingMap.tsx) จัดการ pan/zoom/fit bounds
+  // เองโดยตรงจากพิกัด lat/lng จริง แม่นกว่าการคำนวณ % เทียบ bbox เอง และลาก/ซูมได้จริงด้วย
+  // ตำแหน่งจำลอง (fallback ตอนยังไม่มี techLiveCoords) ก็ถูกตัดออกเช่นกัน — ให้แผนที่บอกตามตรง
+  // ว่า "กำลังรอสัญญาณ GPS จากช่าง..." แทนที่จะแกล้งขยับหมุดตามเวลา ให้ตรงกับที่ขอ "แผนที่ GPS
+  // ต้องเป็นของจริงแบบ real-time" มากขึ้น
 
   // เวลาที่เหลือ (นาที) ก่อนช่างจะถึงจุดเกิดเหตุ ลดลงเรื่อยๆ ตามความคืบหน้าของหมุดช่างที่วิ่งเข้าหาหมุดแดง
   const getEtaMinutesRemaining = () => {
@@ -1666,10 +2052,12 @@ const handleConfirmTowingBooking = async () => {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-slate-900 p-4 font-sans antialiased">
-      {/* หมายเหตุ: เพิ่ม class "transform" ที่นี่เพื่อทำให้กรอบมือถือกลายเป็น containing block
-          ของ position:fixed ทั้งหมดที่อยู่ข้างใน (modal, popup, alert) จะได้ไม่หลุดออกไปเต็มจอเบราว์เซอร์ */}
-      <div className="relative h-[844px] w-[390px] overflow-hidden rounded-[50px] border-[12px] border-slate-800 bg-black shadow-2xl transform">
+    <div className="flex min-h-screen w-full items-stretch justify-center bg-slate-900 font-sans antialiased">
+      {/* หมายเหตุ: เอากรอบมือถือจำลอง (fixed 390x844px + ขอบดำ + มุมโค้ง) ออก เพราะตอนรันเป็น
+          native app ผ่าน Capacitor จอจริงของเครื่องมีขนาด/รอยบากอยู่แล้ว ไม่ต้องจำลองซ้ำ
+          เพิ่ม class "transform" ไว้เหมือนเดิมเพื่อทำให้กรอบนี้เป็น containing block
+          ของ position:fixed ทั้งหมดที่อยู่ข้างใน (modal, popup, alert) จะได้ไม่หลุดออกไปเต็มจอ */}
+      <div className="relative h-dvh w-full max-w-[480px] overflow-hidden bg-black shadow-2xl transform">
         
         {/* Dynamic OTP Banner */}
         {showOtpNotification && (
@@ -1689,33 +2077,8 @@ const handleConfirmTowingBooking = async () => {
           </div>
         )}
 
-        {/* Dynamic Island */}
-        <div className="absolute top-2 left-1/2 z-50 h-7 w-28 -translate-x-1/2 rounded-full bg-black flex items-center justify-between px-2">
-          <div className="h-2.5 w-2.5 rounded-full bg-slate-900/80 ring-1 ring-slate-800" />
-          <div className="h-3 w-3 rounded-full bg-blue-950/40 flex items-center justify-center">
-            <div className="h-1 w-1 rounded-full bg-blue-500/60" />
-          </div>
-        </div>
-
-        {/* Status Bar */}
-        <div className="absolute top-0 left-0 right-0 z-40 flex items-center justify-between px-7 pt-3 text-xs font-semibold text-slate-800 drop-shadow-sm">
-          <span>{time || '09:41'}</span>
-          <div className="flex items-center gap-1.5">
-            {isWifiOnline ? (
-              <Wifi className="h-3.5 w-3.5" />
-            ) : (
-              <WifiOff className="h-3.5 w-3.5 text-red-500" />
-            )}
-            <div className="flex items-center gap-0.5">
-              <span className="text-[10px] font-bold">{batteryLevel}%</span>
-              {isCharging ? (
-                <BatteryCharging className="h-4 w-4 fill-amber-500 text-amber-500" />
-              ) : (
-                <Battery className="h-4 w-4 fill-slate-800" />
-              )}
-            </div>
-          </div>
-        </div>
+        {/* Status Bar เอาออกทั้งหมดแล้ว (ทุกหน้ารวม Home) — ตอนรันเป็น native app ผ่าน
+            Capacitor จอเครื่องมีแถบสถานะจริงอยู่แล้ว ไม่ต้องจำลองซ้ำ */}
 
         {/* Main View Area */}
         <div className="h-full w-full bg-white flex flex-col justify-between overflow-y-auto">
@@ -1723,7 +2086,7 @@ const handleConfirmTowingBooking = async () => {
           {/* STEP 1: Splash Screen */}
           {step === 1 && (
             <div 
-              onClick={() => setStep(2)}
+              onClick={goPastSplash}
               className="flex h-full flex-col items-center justify-center p-6 pt-12 text-center cursor-pointer select-none"
             >
               <div className="relative h-48 w-full max-w-[280px]">
@@ -1731,6 +2094,7 @@ const handleConfirmTowingBooking = async () => {
                   src="/logodtc1.png"
                   alt="DTC Intelligent Towing Logo"
                   fill
+                  sizes="280px"
                   className="object-contain"
                   priority
                 />
@@ -1746,6 +2110,7 @@ const handleConfirmTowingBooking = async () => {
                   src="/w7.JPG"
                   alt="Towing Service"
                   fill
+                  sizes="100vw"
                   className="object-cover object-top"
                   priority
                 />
@@ -1802,6 +2167,7 @@ const handleConfirmTowingBooking = async () => {
                   src="/w3.JPG"
                   alt="Accept Terms"
                   fill
+                  sizes="100vw"
                   className="object-cover object-top"
                   priority
                 />
@@ -1852,6 +2218,7 @@ const handleConfirmTowingBooking = async () => {
                   src="/w2.JPG"
                   alt="AI Fleet Optimizer"
                   fill
+                  sizes="100vw"
                   className="object-cover object-top"
                   priority
                 />
@@ -1881,7 +2248,7 @@ const handleConfirmTowingBooking = async () => {
 
           {/* STEP 5: Login / Register Form */}
           {step === 5 && (
-            <div className="relative flex h-full flex-col justify-between bg-white pt-10 px-5 pb-6 overflow-y-auto">
+            <div className="relative flex h-full flex-col justify-between bg-white px-5 pb-6 overflow-y-auto">
               
               <div className="relative flex items-center justify-between z-30 pt-1">
                 {authTab === 'newAccount' ? (
@@ -1939,6 +2306,7 @@ const handleConfirmTowingBooking = async () => {
                     src="/logodtc1.png"
                     alt="Intelligent Towing Logo"
                     fill
+                    sizes="260px"
                     className="object-contain"
                     priority
                   />
@@ -2001,7 +2369,7 @@ const handleConfirmTowingBooking = async () => {
                             : 'border border-slate-200 bg-slate-50 focus:border-cyan-500 focus:bg-white'
                         }`}
                       />
-                      {emailError && (
+                      {emailError && !loginEmail.trim() && (
                         <p className="mt-1 text-[10px] font-semibold text-red-500 pl-1">
                           {t.emailRequiredErr}
                         </p>
@@ -2052,9 +2420,10 @@ const handleConfirmTowingBooking = async () => {
 
                     <button 
                       type="submit"
-                      className="w-full rounded-full bg-cyan-500 py-3 text-xs font-bold text-white shadow-md active:scale-95 transition-transform mt-1"
+                      disabled={authSubmitting}
+                      className="w-full rounded-full bg-cyan-500 py-3 text-xs font-bold text-white shadow-md active:scale-95 transition-transform mt-1 disabled:opacity-60 disabled:active:scale-100"
                     >
-                      {t.signIn}
+                      {authSubmitting ? 'กำลังเข้าสู่ระบบ...' : t.signIn}
                     </button>
 
                     <div className="text-center pt-1">
@@ -2092,27 +2461,15 @@ const handleConfirmTowingBooking = async () => {
 
                       <button 
                         type="button" 
-                        onClick={handleGoogleSelect}
+                        onClick={handleLineSelect}
                         className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-2 text-xs font-semibold text-slate-700 shadow-xs hover:bg-slate-50 active:scale-95 transition-all"
                       >
-                        <svg className="h-3.5 w-3.5" viewBox="0 0 24 24">
-                          <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
-                          <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
-                          <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z" />
-                          <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" />
-                        </svg>
-                        <span>{t.signUpGoogle}</span>
-                      </button>
-
-                      <button 
-                        type="button" 
-                        onClick={handleAppleAuth}
-                        className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-2 text-xs font-semibold text-slate-700 shadow-xs hover:bg-slate-50 active:scale-95 transition-all"
-                      >
-                        <svg className="h-3.5 w-3.5 fill-black" viewBox="0 0 24 24">
-                          <path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M15.97 6.85c.62-.75 1.04-1.8 0.93-2.85-.9.04-2 .6-2.65 1.35-.58.67-.99 1.74-.85 2.77 1.01.08 2.04-.52 2.57-1.27z"/>
-                        </svg>
-                        <span>{t.signUpApple}</span>
+                        <div className="flex h-4 w-4 items-center justify-center rounded-full bg-[#06C755] text-white">
+                          <svg className="h-2.5 w-2.5" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 2C6.48 2 2 5.87 2 10.5c0 4.02 3.36 7.4 7.93 8.16-.11.5-.68 2.28-.78 2.63 0 0-.02.13.06.18.08.05.17.02.17.02.23-.03 2.65-1.75 3.73-2.47.62.09 1.26.14 1.89.14 5.52 0 10-3.87 10-8.66S17.52 2 12 2z" />
+                          </svg>
+                        </div>
+                        <span>{t.signUpLine}</span>
                       </button>
                     </div>
                   </form>
@@ -2165,51 +2522,100 @@ const handleConfirmTowingBooking = async () => {
                         type="email"
                         placeholder={t.emailPlaceholder}
                         value={registerForm.email}
-                        onChange={(e) => handleRegisterInputChange('email', e.target.value)}
+                        onChange={(e) => {
+                          handleRegisterInputChange('email', e.target.value);
+                          setRegEmailErrMsg('');
+                        }}
                         className={`w-full rounded-xl px-4 py-2 text-xs font-medium text-slate-800 placeholder-slate-400 focus:outline-none transition-all shadow-xs ${
                           regEmailErr
                             ? 'border-2 border-red-500 bg-red-50 ring-2 ring-red-100'
                             : 'border border-slate-200/50 bg-slate-100/80 focus:bg-white focus:border-cyan-500'
                         }`}
                       />
+                      {regEmailErrMsg && (
+                        <p className="mt-1 text-[10px] font-semibold text-red-500 pl-1">{regEmailErrMsg}</p>
+                      )}
                     </div>
 
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="relative">
                       <input
-                        type="text"
-                        placeholder={t.carBrand}
-                        value={registerForm.carBrand}
-                        onChange={(e) => handleRegisterInputChange('carBrand', e.target.value)}
-                        className="w-full rounded-xl px-3 py-2 text-xs font-medium text-slate-800 border border-slate-200/50 bg-slate-100/80 focus:bg-white focus:border-cyan-500 focus:outline-none"
-                      />
-                      <input
-                        type="text"
-                        placeholder={t.carModel}
-                        value={registerForm.carModel}
-                        onChange={(e) => handleRegisterInputChange('carModel', e.target.value)}
-                        className="w-full rounded-xl px-3 py-2 text-xs font-medium text-slate-800 border border-slate-200/50 bg-slate-100/80 focus:bg-white focus:border-cyan-500 focus:outline-none"
-                      />
-                    </div>
-
-                    <div>
-                      <input
-                        type="text"
-                        placeholder={t.carNo}
-                        value={registerForm.carNumber}
-                        onChange={(e) => handleRegisterInputChange('carNumber', e.target.value)}
-                        className={`w-full rounded-xl px-4 py-2 text-xs font-medium text-slate-800 placeholder-slate-400 focus:outline-none transition-all shadow-xs ${
-                          regCarNoErr
+                        type={showRegPassword ? 'text' : 'password'}
+                        placeholder={t.passwordPlaceholder}
+                        value={regPassword}
+                        onChange={(e) => {
+                          setRegPassword(e.target.value);
+                          if (e.target.value.trim()) setRegPasswordErr('');
+                        }}
+                        className={`w-full rounded-xl px-4 py-2 pr-10 text-xs font-medium text-slate-800 placeholder-slate-400 focus:outline-none transition-all shadow-xs ${
+                          regPasswordErr
                             ? 'border-2 border-red-500 bg-red-50 ring-2 ring-red-100'
                             : 'border border-slate-200/50 bg-slate-100/80 focus:bg-white focus:border-cyan-500'
                         }`}
                       />
+                      <button
+                        type="button"
+                        onClick={() => setShowRegPassword(!showRegPassword)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                      >
+                        {showRegPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                      </button>
+                      {regPasswordErr && (
+                        <p className="mt-1 text-[10px] font-semibold text-red-500 pl-1">{regPasswordErr}</p>
+                      )}
                     </div>
+
+                    <div className="relative">
+                      <input
+                        type={showRegConfirmPassword ? 'text' : 'password'}
+                        placeholder={t.confirmPasswordLabel}
+                        value={regConfirmPassword}
+                        onChange={(e) => {
+                          setRegConfirmPassword(e.target.value);
+                          if (e.target.value.trim()) setRegConfirmPasswordErr('');
+                        }}
+                        className={`w-full rounded-xl px-4 py-2 pr-10 text-xs font-medium text-slate-800 placeholder-slate-400 focus:outline-none transition-all shadow-xs ${
+                          regConfirmPasswordErr
+                            ? 'border-2 border-red-500 bg-red-50 ring-2 ring-red-100'
+                            : 'border border-slate-200/50 bg-slate-100/80 focus:bg-white focus:border-cyan-500'
+                        }`}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowRegConfirmPassword(!showRegConfirmPassword)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                      >
+                        {showRegConfirmPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                      </button>
+                      {regConfirmPasswordErr && (
+                        <p className="mt-1 text-[10px] font-semibold text-red-500 pl-1">{regConfirmPasswordErr}</p>
+                      )}
+                    </div>
+
+                    {/* กล่องเงื่อนไขรหัสผ่าน — ดีไซน์เดียวกับฝั่งช่าง */}
+                    <div className="rounded-xl bg-amber-50 border border-amber-100 px-3 py-2.5 space-y-1">
+                      <p className="text-[10px] font-bold text-amber-700 flex items-center gap-1">
+                        <AlertCircle className="h-3 w-3" /> {t.passwordMustContain}
+                      </p>
+                      <p className={`text-[10px] flex items-center gap-1 ${regPasswordChecks.length ? 'text-emerald-600' : 'text-slate-500'}`}>
+                        <Check className="h-3 w-3" /> {t.pwdReqLength}
+                      </p>
+                      <p className={`text-[10px] flex items-center gap-1 ${regPasswordChecks.uppercase ? 'text-emerald-600' : 'text-slate-500'}`}>
+                        <Check className="h-3 w-3" /> {t.pwdReqUppercase}
+                      </p>
+                      <p className={`text-[10px] flex items-center gap-1 ${regPasswordChecks.numberSpecial ? 'text-emerald-600' : 'text-slate-500'}`}>
+                        <Check className="h-3 w-3" /> {t.pwdReqNumberSpecial}
+                      </p>
+                    </div>
+
+                    {/* ยี่ห้อ/รุ่น/ทะเบียนรถ ย้ายออกจากหน้าสมัครสมาชิกแล้ว (รกเกินไป) —
+                        ไปกรอกตอนเรียกช่างแทน ดูส่วน "ข้อมูลลูกค้า & รถยนต์" ในแท็บ request */}
 
                     <button
                       onClick={handleRegisterSubmit}
-                      className="w-full rounded-full bg-cyan-500 py-2.5 text-xs font-bold text-white shadow-md active:scale-95 transition-all mt-2"
+                      disabled={authSubmitting}
+                      className="w-full rounded-full bg-cyan-500 py-2.5 text-xs font-bold text-white shadow-md active:scale-95 transition-all mt-2 disabled:opacity-60 disabled:active:scale-100"
                     >
-                      {t.next}
+                      {authSubmitting ? 'กำลังสมัครสมาชิก...' : t.next}
                     </button>
                   </div>
                 )}
@@ -2234,6 +2640,7 @@ const handleConfirmTowingBooking = async () => {
                     src="/w4.JPG"
                     alt="Forget Password Illustration"
                     fill
+                    sizes="280px"
                     className="object-contain"
                     priority
                   />
@@ -2291,6 +2698,7 @@ const handleConfirmTowingBooking = async () => {
                     src="/w5.JPG"
                     alt="OTP Verification Illustration"
                     fill
+                    sizes="280px"
                     className="object-contain"
                     priority
                   />
@@ -2347,6 +2755,7 @@ const handleConfirmTowingBooking = async () => {
                     src="/w6.JPG"
                     alt="Create New Password Illustration"
                     fill
+                    sizes="280px"
                     className="object-contain"
                     priority
                   />
@@ -2457,7 +2866,7 @@ const handleConfirmTowingBooking = async () => {
 
           {/* STEP 9: MAIN DASHBOARD */}
           {step === 9 && (
-            <div className="relative flex h-full flex-col justify-between bg-slate-50 pt-10 pb-16 overflow-hidden">
+            <div className="relative flex h-full flex-col justify-between bg-slate-50 pb-16 overflow-hidden">
               
               {/* Top Navigation Bar */}
               <div className="flex items-center justify-between px-5 pt-2 pb-3 bg-white border-b border-slate-100 z-30">
@@ -2590,16 +2999,6 @@ const handleConfirmTowingBooking = async () => {
                           <span>{t.sidebarHistory}</span>
                         </button>
 
-                        <button 
-                          onClick={() => { setActiveTab('profile'); setShowSidebar(false); }}
-                          className={`flex w-full items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all ${
-                            activeTab === 'profile' ? 'bg-sky-50 text-sky-600' : 'text-slate-600 hover:bg-slate-50'
-                          }`}
-                        >
-                          <User className="h-4 w-4" />
-                          <span>{t.sidebarProfile}</span>
-                        </button>
-
                         <div className="my-2 border-t border-slate-100" />
 
                         <button 
@@ -2646,6 +3045,10 @@ const handleConfirmTowingBooking = async () => {
                       <button 
                         onClick={() => {
                           setShowSidebar(false);
+                          // เดิมแค่สลับหน้าจอกลับไปล็อกอิน ไม่เคยเคลียร์ session ของ Supabase
+                          // Auth จริงเลย ทำให้ล็อกอินเก่ายังค้างอยู่เบื้องหลัง — เพิ่ม signOutCustomer()
+                          signOutCustomer().catch(() => {});
+                          setCustomerProfile(null);
                           setStep(5);
                         }}
                         className="flex w-full items-center justify-center gap-2 rounded-xl bg-red-50 py-2.5 text-xs font-bold text-red-600 hover:bg-red-100 active:scale-95 transition-all"
@@ -2678,6 +3081,7 @@ const handleConfirmTowingBooking = async () => {
                           src={src}
                           alt={`Promotion Banner ${index + 1}`}
                           fill
+                          sizes="100vw"
                           className="object-cover"
                           priority={index === 0}
                         />
@@ -2825,7 +3229,7 @@ const handleConfirmTowingBooking = async () => {
                   <div className="rounded-2xl bg-white p-3.5 shadow-xs border border-sky-100">
                     <h2 className="text-xs font-bold text-slate-800 mb-2 flex items-center gap-1.5">
                       <User className="h-4 w-4 text-sky-500" />
-                      <span>ข้อมูลลูกค้า & รถยนต์</span>
+                      <span>ข้อมูลผู้แจ้ง</span>
                     </h2>
                     <div className="grid grid-cols-2 gap-2 text-[11px] bg-slate-50 p-2.5 rounded-xl border border-slate-100">
                       <div>
@@ -2836,40 +3240,46 @@ const handleConfirmTowingBooking = async () => {
                         <span className="text-slate-400 block text-[9px]">เบอร์โทรศัพท์:</span>
                         <span className="font-bold text-slate-800">{registerForm.phoneNumber}</span>
                       </div>
-                      <div>
-                        <span className="text-slate-400 block text-[9px]">ยี่ห้อ / รุ่นรถ:</span>
-                        <span className="font-bold text-slate-800">{registerForm.carBrand} {registerForm.carModel}</span>
-                      </div>
-                      <div>
-                        <span className="text-slate-400 block text-[9px]">ทะเบียนรถ:</span>
-                        <span className="font-bold text-sky-600 bg-sky-50 px-1.5 py-0.5 rounded border border-sky-200 inline-block">{registerForm.carNumber}</span>
-                      </div>
                     </div>
                   </div>
 
                   <div className="rounded-2xl bg-white p-3.5 shadow-xs border border-sky-100 space-y-3">
-                    <div>
-                      <label className="text-xs font-bold text-slate-800 mb-1.5 block flex items-center gap-1.5">
-                        <Truck className="h-4 w-4 text-sky-500" />
-                        <span>เลือกประเภทรถบริการ ({t.serviceType})</span>
-                      </label>
-                      <div className="grid grid-cols-2 gap-2">
-                        {['รถสไลด์ (Slide Tow)', 'รถยกช้อนล้อ (Lift Tow)'].map((type) => (
-                          <button
-                            key={type}
-                            type="button"
-                            onClick={() => setTowingRequest(prev => ({ ...prev, towType: type }))}
-                            className={`p-2.5 rounded-xl text-[11px] font-bold border transition-all ${
-                              towingRequest.towType === type
-                                ? 'bg-sky-500 text-white border-sky-500 shadow-xs'
-                                : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
-                            }`}
-                          >
-                            {type}
-                          </button>
-                        ))}
+                    {currentIssueConfig.requiresTow ? (
+                      <div>
+                        <label className="text-xs font-bold text-slate-800 mb-1.5 block flex items-center gap-1.5">
+                          <Truck className="h-4 w-4 text-sky-500" />
+                          <span>เลือกประเภทรถบริการ ({t.serviceType})</span>
+                        </label>
+                        <div className="grid grid-cols-2 gap-2">
+                          {['รถสไลด์ (Slide Tow)', 'รถยกช้อนล้อ (Lift Tow)'].map((type) => (
+                            <button
+                              key={type}
+                              type="button"
+                              onClick={() => setTowingRequest(prev => ({ ...prev, towType: type }))}
+                              className={`p-2.5 rounded-xl text-[11px] font-bold border transition-all ${
+                                towingRequest.towType === type
+                                  ? 'bg-sky-500 text-white border-sky-500 shadow-xs'
+                                  : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
+                              }`}
+                            >
+                              {type}
+                            </button>
+                          ))}
+                        </div>
                       </div>
-                    </div>
+                    ) : (
+                      <div>
+                        <label className="text-xs font-bold text-slate-800 mb-1.5 block flex items-center gap-1.5">
+                          <Wrench className="h-4 w-4 text-sky-500" />
+                          <span>บริการที่จะได้รับ</span>
+                        </label>
+                        {/* อาการนี้ไม่ต้องใช้รถลาก/สไลด์ — ส่งช่างเฉพาะทางไปแทน (ราคาถูกกว่า) */}
+                        <div className="rounded-xl bg-sky-50 border border-sky-200 px-3 py-2.5 flex items-center justify-between">
+                          <span className="text-[11px] font-bold text-sky-700">{currentIssueConfig.label}</span>
+                          <span className="text-[10px] font-bold text-slate-500">ไม่ต้องใช้รถลาก</span>
+                        </div>
+                      </div>
+                    )}
 
                     <div>
                       <label className="text-xs font-bold text-slate-800 mb-1.5 block flex items-center gap-1.5">
@@ -2920,7 +3330,7 @@ const handleConfirmTowingBooking = async () => {
                             disabled={isFetchingLocation}
                             className="w-full text-left text-sky-600 font-bold disabled:opacity-60"
                           >
-                            {isFetchingLocation ? t.emergencySearching : 'ยังไม่ได้ตรึง GPS จุดเกิดเหตุ — แตะเพื่อระบุตำแหน่งตอนนี้'}
+                            {isFetchingLocation ? t.emergencySearching : 'ยังไม่พบตำแหน่งของคุณ — แตะเพื่อลองอีกครั้ง'}
                           </button>
                         )}
                         {locationError && !liveCoords && (
@@ -2938,15 +3348,24 @@ const handleConfirmTowingBooking = async () => {
                       </div>
                     </div>
 
-                    <div>
-                      <span className="text-xs font-bold text-slate-800 flex items-center gap-1 mb-1">
-                        <Wrench className="h-4 w-4 text-amber-500" />
-                        <span>{t.nearestGarage}</span>
-                      </span>
-                      <div className="p-2 bg-slate-50 rounded-xl border border-slate-200 text-[11px] text-slate-700 font-medium">
-                        {towingRequest.nearestGarage || 'รอตำแหน่ง GPS จุดเกิดเหตุเพื่อค้นหาอู่ใกล้เคียง'}
+                    {currentIssueConfig.requiresTow ? (
+                      <div>
+                        <span className="text-xs font-bold text-slate-800 flex items-center gap-1 mb-1">
+                          <Wrench className="h-4 w-4 text-amber-500" />
+                          <span>{t.nearestGarage}</span>
+                        </span>
+                        <div className="p-2 bg-slate-50 rounded-xl border border-slate-200 text-[11px] text-slate-700 font-medium">
+                          {towingRequest.nearestGarage || 'รอตำแหน่ง GPS จุดเกิดเหตุเพื่อค้นหาอู่ใกล้เคียง'}
+                        </div>
                       </div>
-                    </div>
+                    ) : (
+                      // อาการที่ไม่ต้องใช้รถลาก (แบตหมด/ยางแตก) — ช่างซ่อมให้เสร็จหน้างานเลย
+                      // ไม่ต้องนำรถไปอู่ปลายทาง จึงไม่แสดงขั้นตอนหาอู่ใกล้เคียงให้สับสน
+                      <div className="p-2.5 bg-emerald-50 rounded-xl border border-emerald-100 text-[11px] text-emerald-700 font-semibold flex items-center gap-1.5">
+                        <Wrench className="h-3.5 w-3.5 shrink-0" />
+                        <span>{currentIssueConfig.label || 'ช่างซ่อมให้เสร็จที่หน้างานเลย ไม่ต้องนำรถไปอู่'}</span>
+                      </div>
+                    )}
                   </div>
 
                   {/* ส่วนเลือกวิธีชำระเงิน — ใช้ selectedPaymentMethod ตัวเดียวกับแท็บ "วิธีการชำระเงิน"
@@ -3011,9 +3430,10 @@ const handleConfirmTowingBooking = async () => {
                         <div className="flex flex-col items-center gap-1.5 rounded-xl border border-dashed border-sky-200 bg-sky-50/50 p-3">
                           <div className="relative h-36 w-36 rounded-lg overflow-hidden bg-white border border-slate-200">
                             <Image
-                              src="/company-promptpay-qr.png"
+                              src="QR.png"
                               alt="QR Code PromptPay บริษัท"
                               fill
+                              sizes="144px"
                               className="object-contain p-1.5"
                             />
                           </div>
@@ -3048,6 +3468,7 @@ const handleConfirmTowingBooking = async () => {
                                 src={slipImage}
                                 alt="Payment Slip Preview"
                                 fill
+                                sizes="100vw"
                                 className="object-contain"
                               />
                             </div>
@@ -3138,9 +3559,15 @@ const handleConfirmTowingBooking = async () => {
                     </p>
                   )}
 
+                  {liveCoords && selectedPaymentMethod === 'promptpay' && !slipFile && (
+                    <p className="text-[10px] text-center text-red-500 font-semibold -mt-1">
+                      กรุณาแนบสลิปการโอนเงินในแท็บ "วิธีการชำระเงิน" ก่อน จึงจะเรียกช่างได้
+                    </p>
+                  )}
+
                   <button
                     onClick={handleConfirmTowingBooking}
-                    disabled={!liveCoords}
+                    disabled={!liveCoords || (selectedPaymentMethod === 'promptpay' && !slipFile)}
                     className="w-full rounded-2xl bg-cyan-500 py-3.5 text-xs font-bold text-white shadow-lg active:scale-95 hover:bg-cyan-600 transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:active:scale-100"
                   >
                     <Truck className="h-4 w-4" />
@@ -3303,117 +3730,73 @@ const handleConfirmTowingBooking = async () => {
                         <span>ย้อนกลับหน้ารายการ</span>
                       </button>
 
-                      {/* OpenStreetMap Iframe แผนที่จริง + Interactive Overlay Markers */}
-                      <div className="relative h-64 w-full rounded-2xl overflow-hidden shadow-md border border-slate-300/80">
-                        {(() => {
-                          const bounds = getMapBounds();
-                          return (
-                            <iframe
-                              title="OpenStreetMap Live Tracking"
-                              width="100%"
-                              height="100%"
-                              frameBorder="0"
-                              scrolling="no"
-                              src={`https://www.openstreetmap.org/export/embed.html?bbox=${bounds.minLng}%2C${bounds.minLat}%2C${bounds.maxLng}%2C${bounds.maxLat}&amp;layer=mapnik`}
-                              className="w-full h-full pointer-events-none"
-                            />
-                          );
-                        })()}
-                        
-                        {/* Status Tag บนสุด */}
-                        <div className="absolute top-2.5 left-2.5 z-20 bg-white/90 backdrop-blur-md px-2.5 py-1 rounded-xl shadow-xs border border-slate-200 flex items-center gap-1.5">
-                          <span className="relative flex h-2 w-2">
-                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                            <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                          </span>
-                          <span className="text-[10px] font-bold text-slate-700">
-                            {trackingPhase === 'moving_to_red' && 'ช่างกำลังเดินทางไปจุดเกิดเหตุ'}
-                            {trackingPhase === 'loading' && 'กำลังยกรถขึ้นรถสไลด์...'}
-                            {(trackingPhase === 'moving_to_green' || trackingPhase === 'completed') && 'กำลังนำรถไปส่งที่อู่จุดหมาย'}
-                          </span>
-                        </div>
-
-                        {/* 1. หมุดช่างสีส้ม */}
-                        {(() => {
-                          const pos = getTruckPosition();
-                          return (
-                            <div 
-                              className="absolute z-30 transition-all duration-500 ease-linear flex flex-col items-center -translate-x-1/2 -translate-y-1/2"
-                              style={{ top: `${pos.top}%`, left: `${pos.left}%` }}
+                      {/* แบนเนอร์แจ้งเตือนเมื่อช่างปฏิเสธสลิป/การชำระเงิน — ให้ลูกค้ารู้ทันทีและแนบใหม่ได้เลย
+                          แทนที่จะค้างไม่รู้อะไรเหมือนเดิม (เกิดได้เฉพาะวิธีชำระผ่านสลิปโอนเงินเท่านั้น) */}
+                      {myPayment?.status === 'rejected' && myPayment.payment_method === 'transfer' && (
+                        <div className="rounded-2xl bg-red-50 border border-red-200 p-3.5 space-y-2.5">
+                          <p className="text-xs font-bold text-red-600 flex items-center gap-1.5">
+                            <AlertCircle className="h-4 w-4" /> ช่างแจ้งว่าสลิปไม่ถูกต้อง
+                          </p>
+                          <p className="text-[10px] text-red-500">
+                            กรุณาตรวจสอบยอดโอนอีกครั้งแล้วแนบสลิปใหม่ด้านล่างนี้
+                          </p>
+                          <input
+                            ref={reslipFileInputRef}
+                            type="file"
+                            accept="image/*"
+                            className="hidden"
+                            onChange={(e) => setReslipFile(e.target.files?.[0] ?? null)}
+                          />
+                          {!reslipFile ? (
+                            <button
+                              onClick={() => reslipFileInputRef.current?.click()}
+                              className="w-full rounded-xl border-2 border-dashed border-red-300 bg-white py-3 text-[11px] font-bold text-red-500 flex items-center justify-center gap-1.5"
                             >
-                              <div className="bg-orange-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-md shadow-md border border-white whitespace-nowrap mb-0.5 flex items-center gap-1">
-                                <Truck className="h-3 w-3" />
-                                <span>
-                                  {trackingPhase === 'loading' ? 'ยกรถขึ้นรถสไลด์' : 'ช่างสไลด์'}
-                                </span>
-                              </div>
-                              <div className="relative flex items-center justify-center">
-                                <span className="animate-ping absolute inline-flex h-7 w-7 rounded-full bg-orange-400 opacity-75"></span>
-                                <div className="relative h-6 w-6 rounded-full bg-orange-500 border-2 border-white flex items-center justify-center text-white shadow-lg">
-                                  <Truck className="h-3.5 w-3.5" />
-                                </div>
-                              </div>
-                            </div>
-                          );
-                        })()}
-
-                        {/* 2. หมุดจุดเกิดเหตุสีแดง — ใช้พิกัดจริงจาก liveCoords ถ้ามี ไม่งั้น fallback ตำแหน่งกึ่งกลางแผนที่ */}
-                        {trackingPhase !== 'moving_to_green' && trackingPhase !== 'completed' && (() => {
-                          const pos = liveCoords ? coordsToPercent(liveCoords.lat, liveCoords.lng, getMapBounds()) : { top: 50, left: 50 };
-                          return (
-                            <div
-                              className="absolute z-20 flex flex-col items-center -translate-x-1/2 -translate-y-1/2 animate-in fade-in zoom-in duration-300"
-                              style={{ top: `${pos.top}%`, left: `${pos.left}%` }}
-                            >
-                              <div className="bg-red-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-md shadow-md border border-white whitespace-nowrap mb-0.5">
-                                จุดเกิดเหตุ
-                              </div>
-                              <div className="relative flex items-center justify-center">
-                                <span className="animate-ping absolute inline-flex h-6 w-6 rounded-full bg-red-400 opacity-75"></span>
-                                <MapPin className="h-7 w-7 text-red-600 fill-red-500 filter drop-shadow-md" />
-                              </div>
-                            </div>
-                          );
-                        })()}
-
-                        {/* 3. หมุดจุดหมายปลายทางสีเขียว — ใช้พิกัดอู่จริงจาก towingRequest ถ้ามี ไม่งั้น fallback มุมขวาบน */}
-                        {(() => {
-                          const pos =
-                            towingRequest.nearestGarageLat != null && towingRequest.nearestGarageLng != null
-                              ? coordsToPercent(towingRequest.nearestGarageLat, towingRequest.nearestGarageLng, getMapBounds())
-                              : { top: 25, left: 80 };
-                          return (
-                            <div
-                              className="absolute z-20 flex flex-col items-center -translate-x-1/2 -translate-y-1/2"
-                              style={{ top: `${pos.top}%`, left: `${pos.left}%` }}
-                            >
-                              <div className="bg-emerald-600 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-md shadow-md border border-white whitespace-nowrap mb-0.5">
-                                จุดหมาย (อู่)
-                              </div>
-                              <MapPin className="h-7 w-7 text-emerald-600 fill-emerald-500 filter drop-shadow-md" />
-                            </div>
-                          );
-                        })()}
-
-                        {/* Legend สรุปหมุดด้านล่างแผนที่ */}
-                        <div className="absolute bottom-2 left-2 right-2 z-20 bg-white/95 backdrop-blur-md p-1.5 rounded-xl shadow-md border border-slate-200/80 flex justify-around items-center text-[9px] font-bold text-slate-700">
-                          <div className="flex items-center gap-1">
-                            <span className="h-2.5 w-2.5 rounded-full bg-orange-500 border border-white shadow-xs"></span>
-                            <span>ช่างสีส้ม</span>
-                          </div>
-                          {trackingPhase !== 'moving_to_green' && trackingPhase !== 'completed' && (
-                            <div className="flex items-center gap-1">
-                              <span className="h-2.5 w-2.5 rounded-full bg-red-500 border border-white shadow-xs"></span>
-                              <span>เกิดเหตุสีแดง</span>
+                              <Upload className="h-3.5 w-3.5" /> แนบสลิปใหม่
+                            </button>
+                          ) : (
+                            <div className="space-y-2">
+                              <p className="text-[10px] text-slate-600 truncate">{reslipFile.name}</p>
+                              <button
+                                onClick={handleReuploadSlip}
+                                disabled={isReuploadingSlip}
+                                className="w-full rounded-xl bg-red-500 py-2.5 text-[11px] font-bold text-white disabled:opacity-50"
+                              >
+                                {isReuploadingSlip ? 'กำลังส่งสลิป...' : 'ส่งสลิปใหม่'}
+                              </button>
                             </div>
                           )}
-                          <div className="flex items-center gap-1">
-                            <span className="h-2.5 w-2.5 rounded-full bg-emerald-500 border border-white shadow-xs"></span>
-                            <span>จุดหมายสีเขียว</span>
-                          </div>
                         </div>
-                      </div>
+                      )}
 
+                      {/* แผนที่ติดตามงาน real-time จริง (Leaflet + OSM) — ลาก/ซูมได้ พิกัดจริงล้วน
+                          ไม่มีตำแหน่งจำลองอีกต่อไป ดู components/LiveTrackingMap.tsx
+                          ไม่ render แผนที่เลยตอนมีหน้าต่างแชต/สายเรียกเข้า/ให้คะแนนรีวิวเปิดซ้อนอยู่
+                          ด้านบน กันไม่ให้แผนที่โผล่ค้างอยู่เบื้องหลังหน้าต่างเหล่านั้น */}
+                      {!activeChatTech && !showIncomingCallModal && !showCallingModal && !showReviewModal && (
+                        <LiveTrackingMap
+                          techPos={techLiveCoords}
+                          pickupPos={liveCoords}
+                          garagePos={
+                            towingRequest.nearestGarageLat != null && towingRequest.nearestGarageLng != null
+                              ? { lat: towingRequest.nearestGarageLat, lng: towingRequest.nearestGarageLng }
+                              : null
+                          }
+                          showPickupMarker={trackingPhase !== 'moving_to_green' && trackingPhase !== 'completed'}
+                          showGarageMarker={currentIssueConfig.requiresTow}
+                          statusLabel={
+                            trackingPhase === 'moving_to_red'
+                              ? 'ช่างกำลังเดินทางไปจุดเกิดเหตุ'
+                              : trackingPhase === 'loading'
+                              ? 'กำลังยกรถขึ้นรถสไลด์...'
+                              : trackingPhase === 'on_site'
+                              ? 'ช่างกำลังซ่อมให้ที่หน้างาน...'
+                              : currentIssueConfig.requiresTow
+                              ? 'กำลังนำรถไปส่งที่อู่จุดหมาย'
+                              : 'ซ่อมเสร็จเรียบร้อยแล้ว'
+                          }
+                        />
+                      )}
                       {/* การ์ดเวลาถึงจุดเกิดเหตุ: นับถอยหลังตามระยะที่หมุดช่างเหลือถึงหมุดแดง */}
                       <div className="rounded-2xl bg-gradient-to-r from-sky-50 to-white p-3.5 shadow-xs border border-sky-100 flex items-center justify-between">
                         <div className="flex items-center gap-2.5">
@@ -3427,7 +3810,9 @@ const handleConfirmTowingBooking = async () => {
                             <p className="text-sm font-black text-sky-700">
                               {trackingPhase === 'moving_to_red' && `ประมาณ ${getEtaMinutesRemaining()} นาที`}
                               {trackingPhase === 'loading' && 'ช่างถึงจุดเกิดเหตุแล้ว กำลังยกรถขึ้นรถสไลด์'}
-                              {(trackingPhase === 'moving_to_green' || trackingPhase === 'completed') && 'กำลังนำรถไปส่งที่อู่จุดหมาย'}
+                              {trackingPhase === 'on_site' && 'ช่างถึงจุดเกิดเหตุแล้ว กำลังซ่อมให้ที่หน้างาน'}
+                              {(trackingPhase === 'moving_to_green' || (trackingPhase === 'completed' && currentIssueConfig.requiresTow)) && 'กำลังนำรถไปส่งที่อู่จุดหมาย'}
+                              {trackingPhase === 'completed' && !currentIssueConfig.requiresTow && 'ซ่อมเสร็จเรียบร้อยแล้ว'}
                             </p>
                           </div>
                         </div>
@@ -3444,9 +3829,10 @@ const handleConfirmTowingBooking = async () => {
                           <div className="flex items-center gap-2.5">
                             <div className="relative h-10 w-10 rounded-xl overflow-hidden shadow-inner shrink-0 bg-sky-100">
                               <Image
-                                src={assignedTech.photoUrl || '/M2.png'}
+                                src={assignedTech.photoUrl || '/M5.png'}
                                 alt={assignedTech.name}
                                 fill
+                                sizes="40px"
                                 className="object-cover"
                               />
                               {/* จุดสถานะสด: เขียว=ออนไลน์/กำลังทำงาน, เหลือง=พัก, เทา=ออฟไลน์ */}
@@ -3614,6 +4000,13 @@ const handleConfirmTowingBooking = async () => {
                             <span className="text-slate-400 text-[10px]">ยอดชำระสุทธิ</span>
                             <span className="font-black text-slate-800">฿{item.price.toLocaleString()}</span>
                           </div>
+
+                          <button
+                            onClick={() => handleReportServiceIssue(item.id)}
+                            className="flex items-center gap-1 text-[10px] font-bold text-red-500 pt-1"
+                          >
+                            <AlertCircle className="h-3 w-3" /> รายงานปัญหา
+                          </button>
                         </div>
                       ))}
                     </div>
@@ -3921,7 +4314,13 @@ const handleConfirmTowingBooking = async () => {
                   </div>
 
                   <button 
-                    onClick={() => setStep(5)}
+                    onClick={() => {
+                      // เดิมแค่สลับหน้าจอกลับไปล็อกอิน ไม่เคยเคลียร์ session ของ Supabase Auth
+                      // จริงเลย — เพิ่ม signOutCustomer() ให้ตรงกับปุ่มออกจากระบบใน sidebar
+                      signOutCustomer().catch(() => {});
+                      setCustomerProfile(null);
+                      setStep(5);
+                    }}
                     className="w-full rounded-2xl bg-red-50 text-red-600 border border-red-100 py-3 text-xs font-bold flex items-center justify-center gap-2 hover:bg-red-100 active:scale-95 transition-all"
                   >
                     <LogOut className="h-4 w-4" />
@@ -4104,6 +4503,7 @@ const handleConfirmTowingBooking = async () => {
                 src={expandedBannerUrl} 
                 alt="Expanded Banner" 
                 fill 
+                sizes="100vw"
                 className="object-contain" 
               />
               <button
@@ -4116,69 +4516,109 @@ const handleConfirmTowingBooking = async () => {
           </div>
         )}
 
-        {/* MODAL: Live Chat กับช่าง */}
+        {/* MODAL: Live Chat กับช่าง — เต็มจอ ไม่ใช่กล่องลอยตรงกลางอีกต่อไป กันปัญหาคีย์บอร์ดบังกล่องพิมพ์ */}
         {activeChatTech && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-3 animate-in fade-in duration-200">
-            <div className="w-full max-w-xs h-[520px] rounded-3xl bg-white shadow-2xl border border-slate-100 flex flex-col justify-between overflow-hidden">
-              
-              {/* Chat Header */}
-              <div className="bg-sky-500 p-3 text-white flex items-center justify-between">
-                <div className="flex items-center gap-2.5">
-                  <div className="h-8 w-8 rounded-full bg-white text-sky-600 font-bold text-xs flex items-center justify-center shadow-xs">
-                    ชส
-                  </div>
-                  <div>
-                    <h3 className="text-xs font-bold leading-tight">{activeChatTech.name}</h3>
-                    <span className="text-[9px] text-sky-100 block">ออนไลน์ • ทะเบียน {activeChatTech.plateNumber}</span>
+          <div className="fixed inset-0 z-50 flex flex-col bg-white animate-in fade-in duration-200">
+
+            {/* Chat Header */}
+            <div className="bg-sky-500 p-3 text-white flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-2.5">
+                <div className="h-8 w-8 rounded-full bg-white text-sky-600 font-bold text-xs flex items-center justify-center shadow-xs">
+                  ชส
+                </div>
+                <div>
+                  <h3 className="text-xs font-bold leading-tight">{activeChatTech.name}</h3>
+                  <span className="text-[9px] text-sky-100 block">ออนไลน์ • ทะเบียน {activeChatTech.plateNumber}</span>
+                </div>
+              </div>
+              <button 
+                onClick={() => setActiveChatTech(null)}
+                className="flex h-7 w-7 items-center justify-center rounded-full bg-white/20 text-white hover:bg-white/30"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {/* Chat Messages Body */}
+            <div className="flex-1 min-h-0 p-3 overflow-y-auto space-y-2.5 bg-slate-50">
+              {chatMessages.map((msg, idx) => (
+                <div 
+                  key={idx} 
+                  className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}
+                >
+                  <div 
+                    className={`max-w-[80%] rounded-2xl px-3 py-2 text-xs shadow-xs ${
+                      msg.sender === 'user'
+                        ? 'bg-sky-500 text-white rounded-br-xs'
+                        : 'bg-white text-slate-800 border border-slate-200 rounded-bl-xs'
+                    }`}
+                  >
+                    {msg.text}
                   </div>
                 </div>
-                <button 
-                  onClick={() => setActiveChatTech(null)}
-                  className="flex h-7 w-7 items-center justify-center rounded-full bg-white/20 text-white hover:bg-white/30"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-
-              {/* Chat Messages Body */}
-              <div className="flex-1 p-3 overflow-y-auto space-y-2.5 bg-slate-50">
-                {chatMessages.map((msg, idx) => (
-                  <div 
-                    key={idx} 
-                    className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}
-                  >
-                    <div 
-                      className={`max-w-[80%] rounded-2xl px-3 py-2 text-xs shadow-xs ${
-                        msg.sender === 'user'
-                          ? 'bg-sky-500 text-white rounded-br-xs'
-                          : 'bg-white text-slate-800 border border-slate-200 rounded-bl-xs'
-                      }`}
-                    >
-                      {msg.text}
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              {/* Chat Input Field */}
-              <div className="p-2.5 bg-white border-t border-slate-100 flex items-center gap-2">
-                <input
-                  type="text"
-                  value={inputMsg}
-                  onChange={(e) => setInputMsg(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-                  placeholder="พิมพ์ข้อความ..."
-                  className="flex-1 rounded-xl bg-slate-100 px-3 py-2 text-xs text-slate-800 focus:outline-none focus:bg-white focus:ring-1 focus:ring-sky-500"
-                />
-                <button
-                  onClick={handleSendMessage}
-                  className="flex h-8 w-8 items-center justify-center rounded-xl bg-sky-500 text-white shadow-xs hover:bg-sky-600 active:scale-95 transition-all"
-                >
-                  <Send className="h-4 w-4" />
-                </button>
-              </div>
-
+              ))}
             </div>
+
+            {/* แบนเนอร์แจ้งเตือนสลิปถูกปฏิเสธ + ปุ่มแนบสลิปใหม่ — เดิมมีแค่ในหน้ารายละเอียดงานที่ซ่อนลึก
+                (ต้องอยู่แท็บ "ติดตามงาน" และไม่ได้กดย้อนกลับเท่านั้น) ทั้งที่ข้อความแจ้งลูกค้าบอกว่า
+                แนบใหม่ได้ที่ "หน้าแชทหรือหน้ารายละเอียดงาน" — ตอนนี้เพิ่มจุดแนบจริงเข้าหน้าแชทด้วย
+                ใช้ input/ปุ่มแยกต่างหาก (reslipChatFileInputRef) แต่แชร์ state/ฟังก์ชันเดิมกับฝั่ง
+                หน้ารายละเอียดงาน (reslipFile, handleReuploadSlip) เพื่อไม่ต้องเขียนใหม่ */}
+            {myPayment?.status === 'rejected' && myPayment.payment_method === 'transfer' && (
+              <div className="mx-2.5 mb-2.5 rounded-2xl bg-red-50 border border-red-200 p-3 space-y-2 shrink-0">
+                <p className="text-xs font-bold text-red-600 flex items-center gap-1.5">
+                  <AlertCircle className="h-4 w-4" /> ช่างแจ้งว่าสลิปไม่ถูกต้อง
+                </p>
+                <p className="text-[10px] text-red-500">
+                  กรุณาตรวจสอบยอดโอนอีกครั้งแล้วแนบสลิปใหม่ด้านล่างนี้
+                </p>
+                <input
+                  ref={reslipChatFileInputRef}
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={(e) => setReslipFile(e.target.files?.[0] ?? null)}
+                />
+                {!reslipFile ? (
+                  <button
+                    onClick={() => reslipChatFileInputRef.current?.click()}
+                    className="w-full rounded-xl border-2 border-dashed border-red-300 bg-white py-2.5 text-[11px] font-bold text-red-500 flex items-center justify-center gap-1.5"
+                  >
+                    <Upload className="h-3.5 w-3.5" /> แนบสลิปใหม่
+                  </button>
+                ) : (
+                  <div className="space-y-2">
+                    <p className="text-[10px] text-slate-600 truncate">{reslipFile.name}</p>
+                    <button
+                      onClick={handleReuploadSlip}
+                      disabled={isReuploadingSlip}
+                      className="w-full rounded-xl bg-red-500 py-2.5 text-[11px] font-bold text-white disabled:opacity-50"
+                    >
+                      {isReuploadingSlip ? 'กำลังส่งสลิป...' : 'ส่งสลิปใหม่'}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Chat Input Field */}
+            <div className="p-2.5 bg-white border-t border-slate-100 flex items-center gap-2 shrink-0">
+              <input
+                type="text"
+                value={inputMsg}
+                onChange={(e) => setInputMsg(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
+                placeholder="พิมพ์ข้อความ..."
+                className="flex-1 rounded-xl bg-slate-100 px-3 py-2 text-xs text-slate-800 focus:outline-none focus:bg-white focus:ring-1 focus:ring-sky-500"
+              />
+              <button
+                onClick={handleSendMessage}
+                className="flex h-8 w-8 items-center justify-center rounded-xl bg-sky-500 text-white shadow-xs hover:bg-sky-600 active:scale-95 transition-all"
+              >
+                <Send className="h-4 w-4" />
+              </button>
+            </div>
+
           </div>
         )}
 
@@ -4268,6 +4708,41 @@ const handleConfirmTowingBooking = async () => {
               <div>
                 <h3 className="text-base font-extrabold text-slate-900">งานบริการเสร็จสิ้น!</h3>
                 <p className="text-[11px] text-slate-400 mt-1">ช่างถึงอู่ปลายทางเรียบร้อยแล้ว ให้คะแนนความพึงพอใจกันหน่อย</p>
+              </div>
+
+              {/* สรุปใบเสร็จย่อ — ราคา/วิธีชำระเงินที่ใช้จริงในงานนี้ เดิมกดจบงานแล้วไม่มีสรุปให้ดูเลย */}
+              <div className="rounded-2xl bg-slate-900 text-white p-3.5 text-left space-y-1.5">
+                <p className="text-[9px] font-bold text-slate-400 uppercase tracking-wide">สรุปค่าบริการ</p>
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-slate-300">ค่าบริการ</span>
+                  <span className="text-sm font-black text-amber-300">
+                    ฿{(towingRequest.calculatedEtvPrice ?? 0).toLocaleString()}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-slate-300">วิธีชำระเงิน</span>
+                  <span className="text-[11px] font-bold text-white">
+                    {myPayment?.payment_method === 'cash'
+                      ? 'เงินสด'
+                      : myPayment?.payment_method === 'credit'
+                      ? 'บัตรเครดิต/เดบิต'
+                      : 'PromptPay / โอนเงิน'}
+                  </span>
+                </div>
+                {myPayment && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] text-slate-300">สถานะ</span>
+                    <span
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                        myPayment.status === 'verified'
+                          ? 'bg-emerald-500/20 text-emerald-300'
+                          : 'bg-amber-500/20 text-amber-300'
+                      }`}
+                    >
+                      {myPayment.status === 'verified' ? 'ช่างยืนยันรับเงินแล้ว' : 'รอช่างตรวจสอบ'}
+                    </span>
+                  </div>
+                )}
               </div>
 
               <div className="rounded-2xl bg-slate-50 border border-slate-100 py-3.5 space-y-1.5">

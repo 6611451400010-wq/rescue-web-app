@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">DTC Service</string>
+    <string name="title_activity_main">DTC Service</string>
+    <string name="package_name">com.dtc.rescueapp</string>
+    <string name="custom_url_scheme">com.dtc.rescueapp</string>
+</resources>
