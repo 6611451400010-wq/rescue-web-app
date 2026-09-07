@@ -9,15 +9,24 @@ import {
   createJob as createJobApi,
   subscribeJob,
   getJob,
+  cancelJob,
   recordJobPayment,
   sendChatMessage,
   submitJobReview,
   registerCustomer,
   signInCustomer,
   signOutCustomer,
+  getCustomerProfileIfExists,
+  completeCustomerProfileAfterOAuth,
+  computeRoute,
+  getTechStatusCounts,
+  subscribeTechStatusCounts,
+  getNearbyTechPreview,
   type TowJob,
   type CustomerProfile,
+  type NearbyTechPreview,
 } from '@/lib/dtc-api';
+import { signInWithLine, registerLineAuthListener } from '@/lib/lineAuth';
 // แก้บั๊กใหญ่: ทั้งไฟล์นี้เดิม insert()/update() ตรงเข้าตาราง payments, chat_messages,
 // reviews, technicians ทั้งหมด — โดน RLS (0001_lock_down_rls.sql) บล็อกเงียบๆ ทุกจุด เพราะ
 // ฝั่งลูกค้าเป็น anon role ล้วน ไม่มี Supabase Auth session (ตามที่ dtc-api.ts บันทึกไว้เอง
@@ -93,7 +102,9 @@ import {
   Lock,
   FileCheck2,
   PhoneCall,
-  Check
+  Check,
+  QrCode,
+  Fuel
 } from 'lucide-react';
 
 type Language = 'EN' | 'TH' | 'CN';
@@ -231,7 +242,240 @@ const translations = {
     pinNew: 'Pin New Location',
     nearestGarage: 'Nearest Garage (Automatic)',
     liveGPS: 'Live GPS',
-    emergencyTermsButton: 'Read Emergency Service Terms'
+    emergencyTermsButton: 'Read Emergency Service Terms',
+    navHome: 'Home',
+    navRequest: 'Request Tow',
+    navHotline: 'Hotline',
+    navHistory: 'History',
+    navProfile: 'Profile',
+    issueBreakdown: 'Breakdown',
+    issueBattery: 'Dead Battery',
+    issueTire: 'Flat Tire',
+    issueFuel: 'Out of Fuel',
+    issueOther: 'Other',
+    describeIssueTitle: 'Describe the Issue / Problem',
+    reporterInfoTitle: 'Reporter Information',
+    reporterNameLabel: 'Reporter Name:',
+    reporterPhoneLabel: 'Phone Number:',
+    towTypeSlide: 'Slide Tow',
+    towTypeLift: 'Lift Tow (Wheel-Lift)',
+    serviceReceiveTitle: 'Service You Will Receive',
+    noTowNeededTag: 'No towing needed',
+    jumpStartService: 'Jump Start Service',
+    tireChangeService: 'Tire Change / Repair Service',
+    fuelDeliveryService: 'Fuel Delivery Service',
+    noTowDefaultMsg: 'A mechanic will fix it on-site — no need to tow your car',
+    techOnBreak: 'Mechanic is on a short break',
+    techOffline: 'Mechanic offline (signal lost)',
+    techEnRoute: 'Heading your way',
+    techLoading: 'Loading car onto the tow truck',
+    techOnSite: 'Repairing on-site',
+    techToGarage: 'Taking your car to the garage',
+    techCompleted: 'Job completed',
+    techWorking: 'Mechanic is working',
+    techHeadingToScene: 'Mechanic is heading to the location',
+    techLoadingEllipsis: 'Loading car onto tow truck...',
+    techOnSiteEllipsis: 'Mechanic is repairing on-site...',
+    techToGarageDest: 'Taking your car to the destination garage',
+    techRepairDone: 'Repair completed',
+    etaWithinLabel: 'Arriving within',
+    currentStatusLabel: 'Current Status',
+    etaApprox: 'About {min} min',
+    arrivedLoading: 'Mechanic arrived, loading car onto tow truck',
+    arrivedOnSite: 'Mechanic arrived, repairing on-site',
+    techLabelLift: 'Lift Tow Mechanic',
+    techLabelSlide: 'Slide Tow Mechanic',
+    techLabelGeneric: 'Mechanic',
+    techCountUnit: '',
+    choosePaymentChannel: 'Choose Payment Method',
+    promptpayTitle: 'PromptPay / Scan QR Code',
+    promptpaySubtitle: 'Transfer and attach the payment slip in the app',
+    creditCardTitle: 'Credit / Debit Card',
+    creditCardSubtitle: 'Automatically charged to your saved card',
+    cashTitle: 'Cash Payment',
+    cashSubtitle: 'Pay the mechanic directly on-site',
+    creditCardShort: 'Credit /',
+    debitCardShort: 'Debit',
+    cashShort: 'Cash',
+    savedCardsTitle: 'Saved Cards',
+    addNewCard: 'Add New Card',
+    primaryBadge: 'Primary',
+    paymentSecurityTitle: 'Payment Security',
+    paymentSecurityDesc: 'All payment data is encrypted to international security standards (SSL Encrypted) — 100% secure',
+    qrCompanyAlt: 'Company PromptPay QR Code',
+    qrCompanyCaption: 'DTC Service Company PromptPay QR',
+    qrScanInstructions: 'Scan the QR code above to pay, then attach the payment slip below to confirm',
+    supportedFileTypes: 'Supports JPG, PNG files',
+    etvPriceHeading: 'ETV Standard Price',
+    totalServicePrice: 'Total Service Price:',
+    gpsRequiredWarning: 'Please pin the GPS location above before requesting a mechanic',
+    slipRequiredWarning: 'Please attach the payment slip in the "Payment Method" tab before requesting a mechanic',
+    serviceHistoryHeading: 'Service History',
+    totalItemsPrefix: 'Total',
+    totalItemsSuffix: 'items',
+    historyDateLabel: 'Date:',
+    historyCarTypeLabel: 'Car Type:',
+    historyLocationLabel: 'Location:',
+    historyTechLabel: 'Mechanic:',
+    netPaidLabel: 'Total Paid',
+    reportIssueBtn: 'Report an Issue',
+    historyStatusCompleted: 'Completed',
+    historyStatusInProgress: 'In Progress',
+    findingNearestTech: 'Finding the nearest mechanic for you...',
+    waitingTechAccept: 'Waiting for a mechanic to accept — the tracking map will open automatically once accepted',
+    cancellingEllipsis: 'Cancelling...',
+    cancelRequestBtn: 'Cancel Request',
+    activeStatusBadge: 'In Progress (Active)',
+    viewLiveTrackingMap: 'View Live Tracking Map',
+    mechanicLabelShort: 'Mechanic:',
+    waitingGarageSearch: 'Waiting for GPS location to search for nearby garages',
+    searchingNearbyTechs: 'Searching for available technicians near you...',
+    nearbyTechsFound: '{count} technician(s) available nearby — nearest about {distance} km away',
+    noNearbyTechsFallback: 'No technician nearby right now, but we will keep searching once you request help',
+    noTowRepairNote: 'The mechanic will repair on-site — no need to tow to a garage',
+    approxLocationSuffix: '(approximate location)',
+    serviceFeeLabel: 'Service Fee',
+    paymentMethodLabel: 'Payment Method',
+    statusLabel: 'Status',
+    paymentMethodTransfer: 'PromptPay / Transfer',
+    techConfirmedPayment: 'Mechanic confirmed payment',
+    waitingTechVerify: 'Waiting for mechanic to verify',
+    viewEnlargedImage: 'View Enlarged Image',
+    creditAutoChargeNote: 'The system will automatically charge your saved card — no slip needed',
+    cashPayDirectNote: 'Pay the mechanic directly on-site — no slip needed',
+    promptpayAfterAcceptNote: 'You can scan the QR code and attach the payment slip on the tracking page once a mechanic accepts your request',
+    sendSlipBtn: 'Send Slip',
+    kmUnit: 'km',
+    jobsUnit: 'jobs',
+    cardDetailsRequiredErr: 'Please fill in all card details',
+    carDetailsRequiredErr: 'Please fill in all car details',
+    approxLocationSetToast: 'Approximate location set. Please re-pin the exact location if possible',
+    slipUploadedToast: 'Payment slip sent. Waiting for mechanic to verify',
+    slipUploadFailedToast: 'Failed to upload slip — please attach it again from the history page',
+    setPasswordErr: 'Please set a password',
+    passwordInvalidErr: 'Password does not meet the requirements',
+    regConfirmPasswordRequiredErr: 'Please confirm your password',
+    serverConnectFailedToast: 'Could not connect to the server. Please check your internet connection and try again',
+    serverConnectFailedErr: 'Could not connect to the server. Please try again',
+    emailAlreadyUsedErr: 'This email is already registered',
+    signupFailedErr: 'Sign up failed. Please try again',
+    loginInvalidErr: 'Incorrect email or password, or no account found',
+    lineOpenFailedToast: 'Could not open the LINE login page. Please try again',
+    loginSuccessWelcome: 'Login successful. Welcome',
+    lineLoginFailedToast: 'LINE login failed. Please try again',
+    surnameRequiredErr: 'Please enter your surname',
+    phoneRequiredErr: 'Please enter your phone number',
+    emailRequiredLineErr: 'Please enter your email (LINE did not provide one)',
+    lineSignupSuccessWelcome: 'LINE sign up successful. Welcome',
+    saveFailedTryAgainErr: 'Failed to save. Please try again',
+    passwordMinLengthErr: 'Password must be at least 6 characters',
+    jobCreateFailedToast: 'Request failed: the system did not create a job (create_job_priced returned nothing). Please try again or contact support',
+    submitFailedPrefix: 'Failed to submit:',
+    reportIssuePrompt: 'Briefly describe the issue with this job (e.g. mechanic arrived unusually late, inappropriate behavior):',
+    reportSentToast: 'Report sent. Our team will review it',
+    reportFailedToast: 'Failed to send report (this job may be outdated data no longer in the system)',
+    slipReattachedToast: 'New slip attached. Waiting for mechanic to verify again',
+    slipReattachFailedToast: 'Failed to attach new slip. Please try again',
+    techAcceptedNotif: 'has accepted your job and is on the way',
+    techArrivedToast: 'Mechanic has arrived at the location',
+    techLoadingCarToast: 'Mechanic is loading the car onto the tow truck',
+    carLoadedHeadingToGarageToast: 'Car loaded. Heading to the destination garage',
+    cancelJobSuccessToast: 'Request cancelled successfully',
+    cancelJobFailedToast: 'Cancel failed — a mechanic may have just accepted this job. Try refreshing the page',
+    tapToChoosePlateSubtitle: 'Tap to choose a service type and send your location',
+    updateBtn: 'Update',
+    locationNotFoundTap: 'Your location was not found — tap to try again',
+    useApproxLocationInstead: 'Use approximate location instead',
+    backToListBtn: 'Back to List',
+    slipRejectedByTech: 'Mechanic reported the slip is invalid',
+    reviewSlipAndReattach: 'Please double-check the transfer amount and attach a new slip below',
+    reattachSlipBtn: 'Attach New Slip',
+    sendingSlipEllipsis: 'Sending slip...',
+    resendSlipBtn: 'Resend Slip',
+    towingPlateLabel: 'Tow Truck Plate',
+    techPhoneLabel: 'Mechanic Phone Number',
+    callTechBtn: 'Call Mechanic',
+    chatBtn: 'Chat',
+    onlinePlateStatus: 'Online • Plate',
+    chatInputPlaceholder: 'Type a message...',
+    addNewCardTitle: 'Add New Credit / Debit Card',
+    nameOnCard: 'Name on Card',
+    cardNumberLabel: 'Card Number (16 digits)',
+    expiryLabel: 'Expiry Date (MM/YY)',
+    cvcLabel: 'CVC / CVV Code',
+    saveCardBtn: 'Save Card',
+    jobCompletedTitle: 'Service Completed!',
+    jobCompletedSub: 'Mechanic has arrived at the destination garage. Please rate your experience',
+    serviceFeeSummaryLabel: 'Service Fee Summary',
+    ratingLabels: 'Very Bad,Not Satisfied,Okay,Good,Excellent!',
+    reviewFeedbackPlaceholder: 'Write feedback or compliments for the mechanic (optional)...',
+    submitReviewBtn: 'Submit Review & Close Job',
+    sendingToNearestTechLoading: 'Sending your request to the nearest mechanic...',
+    termsLine1: '1. Terms of service for towing and roadside emergency assistance, DTC Intelligent Towing Service',
+    termsLine2: '2. Users must provide accurate location details and vehicle brand/model information',
+    termsLine3: '3. Service fees are calculated based on the standard ETV rate — mechanics may not charge above this rate',
+    termsLine4: '4. Cancelling after a mechanic has departed may incur a fee as specified in the terms',
+    privacyLine1: '1. We take your privacy and personal data protection seriously (PDPA Compliance)',
+    privacyLine2: '2. Your GPS location and phone number are used only for matching and dispatching a mechanic to assist you',
+    privacyLine3: '3. Card and payment history data is stored under SSL Encrypted security standards and never shared with third parties',
+    notificationsTitle: 'Notifications',
+    markAllReadBtn: 'Mark All as Read',
+    noNotificationsYet: 'No notifications yet',
+    appSettingsTitle: 'App Settings',
+    notificationsSectionLabel: 'Notifications',
+    notificationSoundLabel: 'Notification Sound',
+    vibrationLabel: 'Vibration',
+    displaySectionLabel: 'Display',
+    darkModeLabel: 'Dark Mode',
+    manageMyAccount: 'Manage My Account',
+    deleteAccountRequestToast: 'Account deletion request sent. Our team will contact you within 3 business days',
+    deleteAccountBtn: 'Delete Account',
+    helpCenterTitle: 'Help Center / FAQ',
+    emergencyHotlineBtn: 'Call Emergency Hotline 1176',
+    faqQ1: 'How long until a mechanic arrives after requesting a slide tow?',
+    faqA1: 'On average, a mechanic arrives within 15-30 minutes depending on distance and traffic conditions',
+    faqQ2: 'How is the service fee calculated?',
+    faqA2: 'The system calculates fees based on the standard ETV rate, considering vehicle service type and distance. Mechanics may not charge above the rate shown',
+    faqQ3: 'Can I cancel my request?',
+    faqA3: 'You can cancel before the mechanic departs. Cancelling after they depart may incur a fee per the terms of service',
+    faqQ4: 'What payment methods are supported?',
+    faqA4: 'We support PromptPay (with slip), Credit/Debit Card, and Cash paid directly to the mechanic',
+    carBrandLabel: 'Car Brand',
+    carModelLabel: 'Car Model',
+    plateNumberLabel: 'License Plate',
+    platePlaceholder: 'AB 1234 Bangkok',
+    saveCarBtn: 'Save This Car',
+    callingTechTitle: 'Calling Mechanic',
+    openPhoneAppBtn: 'Open Phone App to Call',
+    cancelBtn: 'Cancel',
+    incomingCallFromTech: 'Incoming Call from Mechanic',
+    declineBtn: 'Decline',
+    answerBtn: 'Answer',
+    almostDoneTitle: 'Almost Done!',
+    fillRemainingInfo: 'Please fill in the remaining details before you start',
+    firstNameLabel: 'First Name',
+    firstNamePlaceholder: 'First Name',
+    lastNamePlaceholder: 'Last Name',
+    phoneNumberLabel: 'Phone Number',
+    emailLabel: 'Email',
+    savingEllipsis: 'Saving...',
+    getStartedBtn: 'Get Started',
+    thankYouForReviewTitle: 'Thanks for Your Review!',
+    thankYouForReviewMsg: 'Thank you for rating and using our service. Your feedback helps us improve',
+    closeWindowBtn: 'Close Window',
+    loadingMapEllipsis: 'Loading map...',
+    offlineBannerText: 'No internet connection — data may not update until connection is restored',
+    signingInEllipsis: 'Signing in...',
+    openingLinePageEllipsis: 'Opening LINE page...',
+    signingUpEllipsis: 'Signing up...',
+    newPasswordPlaceholder: 'Enter new password',
+    confirmNewPasswordPlaceholder: 'Enter new password again',
+    selectServiceTypePrefix: 'Select vehicle service type',
+    yourVehicleTypePrefix: 'Your vehicle type',
+    carCategorySedanOption: 'Sedan (Sedan / Hatchback)',
+    carCategoryEvOption: 'Electric Vehicle (EV / Hybrid)',
+    carCategoryPickupOption: 'Pickup Truck',
+    carCategorySuvOption: 'SUV / Van'
   },
   TH: {
     login: 'เข้าสู่ระบบ',
@@ -342,7 +586,240 @@ const translations = {
     pinNew: 'ปักหมุดใหม่',
     nearestGarage: 'อู่ใกล้เคียงที่สุด (อัตโนมัติ)',
     liveGPS: 'Live GPS',
-    emergencyTermsButton: 'อ่านเงื่อนไขการให้บริการฉุกเฉิน'
+    emergencyTermsButton: 'อ่านเงื่อนไขการให้บริการฉุกเฉิน',
+    navHome: 'หน้าแรก',
+    navRequest: 'เรียกรถยก',
+    navHotline: 'สายด่วน',
+    navHistory: 'ประวัติ',
+    navProfile: 'โปรไฟล์',
+    issueBreakdown: 'รถเสีย',
+    issueBattery: 'แบตหมด',
+    issueTire: 'ยางแตก',
+    issueFuel: 'น้ำมันหมด',
+    issueOther: 'อื่นๆ',
+    describeIssueTitle: 'ระบุอาการเสีย / ปัญหาที่พบ',
+    reporterInfoTitle: 'ข้อมูลผู้แจ้ง',
+    reporterNameLabel: 'ชื่อผู้แจ้ง:',
+    reporterPhoneLabel: 'เบอร์โทรศัพท์:',
+    towTypeSlide: 'รถสไลด์ (Slide Tow)',
+    towTypeLift: 'รถยกช้อนล้อ (Lift Tow)',
+    serviceReceiveTitle: 'บริการที่จะได้รับ',
+    noTowNeededTag: 'ไม่ต้องใช้รถลาก',
+    jumpStartService: 'บริการพ่วงแบตเตอรี่',
+    tireChangeService: 'บริการเปลี่ยน/ปะยาง',
+    fuelDeliveryService: 'บริการนำน้ำมันไปเติมให้',
+    noTowDefaultMsg: 'ช่างซ่อมให้เสร็จที่หน้างานเลย ไม่ต้องนำรถไปอู่',
+    techOnBreak: 'ช่างขอพักชั่วคราว',
+    techOffline: 'ช่างออฟไลน์ (สัญญาณขาดหาย)',
+    techEnRoute: 'กำลังเดินทางมาหาคุณ',
+    techLoading: 'กำลังยกรถขึ้นรถสไลด์',
+    techOnSite: 'กำลังซ่อมให้ที่หน้างาน',
+    techToGarage: 'กำลังนำรถไปส่งอู่',
+    techCompleted: 'งานเสร็จสิ้นแล้ว',
+    techWorking: 'ช่างกำลังทำงาน',
+    techHeadingToScene: 'ช่างกำลังเดินทางไปจุดเกิดเหตุ',
+    techLoadingEllipsis: 'กำลังยกรถขึ้นรถสไลด์...',
+    techOnSiteEllipsis: 'ช่างกำลังซ่อมให้ที่หน้างาน...',
+    techToGarageDest: 'กำลังนำรถไปส่งที่อู่จุดหมาย',
+    techRepairDone: 'ซ่อมเสร็จเรียบร้อยแล้ว',
+    etaWithinLabel: 'ถึงจุดเกิดเหตุภายใน',
+    currentStatusLabel: 'สถานะปัจจุบัน',
+    etaApprox: 'ประมาณ {min} นาที',
+    arrivedLoading: 'ช่างถึงจุดเกิดเหตุแล้ว กำลังยกรถขึ้นรถสไลด์',
+    arrivedOnSite: 'ช่างถึงจุดเกิดเหตุแล้ว กำลังซ่อมให้ที่หน้างาน',
+    techLabelLift: 'ช่างยกซ้อนล้อ',
+    techLabelSlide: 'ช่างสไลด์',
+    techLabelGeneric: 'ช่าง',
+    techCountUnit: 'คน',
+    choosePaymentChannel: 'เลือกช่องทางการชำระเงิน',
+    promptpayTitle: 'PromptPay / สแกน QR Code',
+    promptpaySubtitle: 'โอนชำระพร้อมแนบสลิปผ่านแอป',
+    creditCardTitle: 'บัตรเครดิต / เดบิต (Credit/Debit Card)',
+    creditCardSubtitle: 'ตัดผ่านบัตรที่บันทึกไว้โดยอัตโนมัติ',
+    cashTitle: 'เงินสด (Cash Payment)',
+    cashSubtitle: 'ชำระกับช่างโดยตรงที่หน้างาน',
+    creditCardShort: 'บัตรเครดิต /',
+    debitCardShort: 'เดบิต',
+    cashShort: 'เงินสด',
+    savedCardsTitle: 'บัตรที่บันทึกไว้',
+    addNewCard: 'เพิ่มบัตรใหม่',
+    primaryBadge: 'หลัก',
+    paymentSecurityTitle: 'ความปลอดภัยของระบบชำระเงิน',
+    paymentSecurityDesc: 'ข้อมูลการชำระเงินทั้งหมดได้รับการเข้ารหัสความปลอดภัยระดับมาตรฐานสากล (SSL Encrypted) ปลอดภัย 100%',
+    qrCompanyAlt: 'QR Code PromptPay บริษัท',
+    qrCompanyCaption: 'QR PromptPay บริษัท DTC Service',
+    qrScanInstructions: 'สแกนจ่ายผ่าน QR ด้านบน แล้วแนบสลิปการโอนเงินด้านล่างเพื่อยืนยัน',
+    supportedFileTypes: 'รองรับไฟล์ JPG, PNG',
+    etvPriceHeading: 'ราคากลาง ETV Standard Price',
+    totalServicePrice: 'ค่าบริการรวมสุทธิ:',
+    gpsRequiredWarning: 'กรุณาตรึง GPS จุดเกิดเหตุด้านบนก่อน จึงจะเรียกช่างได้',
+    slipRequiredWarning: 'กรุณาแนบสลิปการโอนเงินในแท็บ "วิธีการชำระเงิน" ก่อน จึงจะเรียกช่างได้',
+    serviceHistoryHeading: 'ประวัติการเรียกใช้บริการ',
+    totalItemsPrefix: 'ทั้งหมด',
+    totalItemsSuffix: 'รายการ',
+    historyDateLabel: 'วันที่:',
+    historyCarTypeLabel: 'ประเภทรถ:',
+    historyLocationLabel: 'สถานที่:',
+    historyTechLabel: 'ช่างผู้ดูแล:',
+    netPaidLabel: 'ยอดชำระสุทธิ',
+    reportIssueBtn: 'รายงานปัญหา',
+    historyStatusCompleted: 'เสร็จสิ้น',
+    historyStatusInProgress: 'กำลังดำเนินการ',
+    findingNearestTech: 'กำลังหาช่างที่ใกล้ที่สุดให้คุณ...',
+    waitingTechAccept: 'รอช่างกดรับงาน แผนที่ติดตามจะเปิดขึ้นอัตโนมัติทันทีที่มีช่างรับงาน',
+    cancellingEllipsis: 'กำลังยกเลิก...',
+    cancelRequestBtn: 'ยกเลิกการเรียกช่าง',
+    activeStatusBadge: 'กำลังดำเนินการ (Active)',
+    viewLiveTrackingMap: 'ดูแผนที่ Live Tracking',
+    mechanicLabelShort: 'ช่าง:',
+    waitingGarageSearch: 'รอตำแหน่ง GPS จุดเกิดเหตุเพื่อค้นหาอู่ใกล้เคียง',
+    searchingNearbyTechs: 'กำลังค้นหาช่างว่างใกล้จุดคุณ...',
+    nearbyTechsFound: 'มีช่างว่างใกล้จุดคุณ {count} คน ใกล้สุดประมาณ {distance} กม.',
+    noNearbyTechsFallback: 'ตอนนี้ยังไม่พบช่างว่างในระยะใกล้ แต่ระบบจะยังคงหาช่างให้หลังจากคุณกดเรียก',
+    noTowRepairNote: 'ช่างซ่อมให้เสร็จที่หน้างานเลย ไม่ต้องนำรถไปอู่',
+    approxLocationSuffix: '(ตำแหน่งโดยประมาณ)',
+    serviceFeeLabel: 'ค่าบริการ',
+    paymentMethodLabel: 'วิธีชำระเงิน',
+    statusLabel: 'สถานะ',
+    paymentMethodTransfer: 'PromptPay / โอนเงิน',
+    techConfirmedPayment: 'ช่างยืนยันรับเงินแล้ว',
+    waitingTechVerify: 'รอช่างตรวจสอบ',
+    viewEnlargedImage: 'ดูรูปขยาย',
+    creditAutoChargeNote: 'ระบบจะตัดผ่านบัตรเครดิต/เดบิตที่บันทึกไว้โดยอัตโนมัติ ไม่ต้องแนบสลิป',
+    cashPayDirectNote: 'ชำระเงินสดกับช่างโดยตรงที่หน้างาน ไม่ต้องแนบสลิป',
+    promptpayAfterAcceptNote: 'คุณสามารถสแกน QR Code และแนบสลิปการโอนเงินได้ในหน้าติดตามงาน หลังจากช่างกดรับงานของคุณแล้ว',
+    sendSlipBtn: 'ส่งสลิป',
+    kmUnit: 'กม.',
+    jobsUnit: 'งาน',
+    cardDetailsRequiredErr: 'กรุณากรอกข้อมูลบัตรให้ครบถ้วน',
+    carDetailsRequiredErr: 'กรุณากรอกข้อมูลรถให้ครบถ้วน',
+    approxLocationSetToast: 'ใช้ตำแหน่งโดยประมาณแล้ว กรุณาปักหมุดแก้ไขให้ตรงจุดเกิดเหตุอีกครั้งหากทำได้',
+    slipUploadedToast: 'ส่งสลิปโอนเงินเรียบร้อย รอช่างตรวจสอบ',
+    slipUploadFailedToast: 'อัปโหลดสลิปไม่สำเร็จ กรุณาแนบสลิปใหม่ในหน้าประวัติงาน',
+    setPasswordErr: 'กรุณาตั้งรหัสผ่าน',
+    passwordInvalidErr: 'รหัสผ่านไม่ตรงตามเงื่อนไขที่กำหนด',
+    regConfirmPasswordRequiredErr: 'กรุณายืนยันรหัสผ่าน',
+    serverConnectFailedToast: 'เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ กรุณาตรวจสอบสัญญาณอินเทอร์เน็ตแล้วลองใหม่อีกครั้ง',
+    serverConnectFailedErr: 'เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง',
+    emailAlreadyUsedErr: 'อีเมลนี้ถูกใช้สมัครสมาชิกไปแล้ว',
+    signupFailedErr: 'สมัครสมาชิกไม่สำเร็จ กรุณาลองใหม่อีกครั้ง',
+    loginInvalidErr: 'อีเมลหรือรหัสผ่านไม่ถูกต้อง หรือยังไม่เคยสมัครสมาชิก',
+    lineOpenFailedToast: 'ไม่สามารถเปิดหน้าล็อกอิน LINE ได้ กรุณาลองใหม่อีกครั้ง',
+    loginSuccessWelcome: 'เข้าสู่ระบบสำเร็จ ยินดีต้อนรับคุณ',
+    lineLoginFailedToast: 'เข้าสู่ระบบด้วย LINE ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง',
+    surnameRequiredErr: 'กรุณากรอกนามสกุล',
+    phoneRequiredErr: 'กรุณากรอกเบอร์โทรศัพท์',
+    emailRequiredLineErr: 'กรุณากรอกอีเมล (LINE ไม่ได้ให้อีเมลมา)',
+    lineSignupSuccessWelcome: 'สมัครสมาชิกด้วย LINE สำเร็จ ยินดีต้อนรับคุณ',
+    saveFailedTryAgainErr: 'บันทึกข้อมูลไม่สำเร็จ กรุณาลองใหม่อีกครั้ง',
+    passwordMinLengthErr: 'รหัสผ่านต้องมีความยาวอย่างน้อย 6 ตัวอักษร',
+    jobCreateFailedToast: 'ส่งคำขอไม่สำเร็จ: ระบบไม่ได้สร้างงานจริง (create_job_priced ไม่คืนค่างานกลับมา) กรุณาลองใหม่หรือแจ้งทีมงาน',
+    submitFailedPrefix: 'ส่งข้อมูลไม่สำเร็จ:',
+    reportIssuePrompt: 'อธิบายปัญหาที่พบกับงานนี้สั้นๆ (เช่น ช่างมาช้าผิดปกติ, พฤติกรรมไม่เหมาะสม):',
+    reportSentToast: 'ส่งรายงานปัญหาแล้ว ทีมงานจะตรวจสอบให้',
+    reportFailedToast: 'ส่งรายงานไม่สำเร็จ (งานนี้อาจเป็นข้อมูลเก่าที่ไม่มีอยู่ในระบบแล้ว)',
+    slipReattachedToast: 'แนบสลิปใหม่เรียบร้อย รอช่างตรวจสอบอีกครั้ง',
+    slipReattachFailedToast: 'แนบสลิปใหม่ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง',
+    techAcceptedNotif: 'รับงานของคุณแล้ว กำลังเดินทางมาหา',
+    techArrivedToast: 'ช่างถึงจุดเกิดเหตุแล้ว',
+    techLoadingCarToast: 'ช่างกำลังยกรถขึ้นรถสไลด์',
+    carLoadedHeadingToGarageToast: 'ยกรถเสร็จแล้ว กำลังนำรถไปส่งที่อู่ปลายทาง',
+    cancelJobSuccessToast: 'ยกเลิกการเรียกช่างเรียบร้อยแล้ว',
+    cancelJobFailedToast: 'ยกเลิกไม่สำเร็จ อาจมีช่างรับงานไปแล้วพอดี ลองรีเฟรชหน้าดูอีกครั้ง',
+    tapToChoosePlateSubtitle: 'กดเพื่อเลือกประเภทบริการและส่งพิกัด',
+    updateBtn: 'อัปเดต',
+    locationNotFoundTap: 'ยังไม่พบตำแหน่งของคุณ — แตะเพื่อลองอีกครั้ง',
+    useApproxLocationInstead: 'ใช้ตำแหน่งโดยประมาณแทน',
+    backToListBtn: 'ย้อนกลับหน้ารายการ',
+    slipRejectedByTech: 'ช่างแจ้งว่าสลิปไม่ถูกต้อง',
+    reviewSlipAndReattach: 'กรุณาตรวจสอบยอดโอนอีกครั้งแล้วแนบสลิปใหม่ด้านล่างนี้',
+    reattachSlipBtn: 'แนบสลิปใหม่',
+    sendingSlipEllipsis: 'กำลังส่งสลิป...',
+    resendSlipBtn: 'ส่งสลิปใหม่',
+    towingPlateLabel: 'ทะเบียนรถยก',
+    techPhoneLabel: 'เบอร์โทรศัพท์ช่าง',
+    callTechBtn: 'โทรหาช่าง',
+    chatBtn: 'แชต',
+    onlinePlateStatus: 'ออนไลน์ • ทะเบียน',
+    chatInputPlaceholder: 'พิมพ์ข้อความ...',
+    addNewCardTitle: 'เพิ่มบัตรเครดิต / เดบิตใหม่',
+    nameOnCard: 'ชื่อบนบัตร',
+    cardNumberLabel: 'หมายเลขบัตร (16 หลัก)',
+    expiryLabel: 'วันหมดอายุ (MM/YY)',
+    cvcLabel: 'รหัส CVC / CVV',
+    saveCardBtn: 'บันทึกบัตรชำระเงิน',
+    jobCompletedTitle: 'งานบริการเสร็จสิ้น!',
+    jobCompletedSub: 'ช่างถึงอู่ปลายทางเรียบร้อยแล้ว ให้คะแนนความพึงพอใจกันหน่อย',
+    serviceFeeSummaryLabel: 'สรุปค่าบริการ',
+    ratingLabels: 'แย่มาก,ไม่ประทับใจ,พอใช้,ดี,ดีเยี่ยม!',
+    reviewFeedbackPlaceholder: 'เขียนข้อเสนอแนะหรือคำชมเชยช่าง (ถ้ามี)...',
+    submitReviewBtn: 'ส่งรีวิวและปิดงาน',
+    sendingToNearestTechLoading: 'ระบบกำลังส่งข้อมูลไปยังช่างสไลด์ที่ใกล้คุณที่สุด...',
+    termsLine1: '1. เงื่อนไขการให้บริการยกรถและช่วยเหลือฉุกเฉิน DTC Intelligent Towing Service',
+    termsLine2: '2. ผู้ใช้บริการต้องให้ข้อมูลพิกัดสถานที่และรายละเอียด ยี่ห้อ/รุ่น ของยานพาหนะตามความเป็นจริง',
+    termsLine3: '3. อัตราค่าบริการคำนวณตามราคากลางมาตรฐาน ETV ห้ามช่างเรียกเก็บเงินเพิ่มเติมเกินอัตรากำหนด',
+    termsLine4: '4. การยกเลิกคำขอหลังช่างออกเดินทางแล้วอาจมีค่าธรรมเนียมตามที่กำหนดในเงื่อนไข',
+    privacyLine1: '1. เราให้ความสำคัญกับความเป็นส่วนตัวและการคุ้มครองข้อมูลส่วนบุคคลของคุณ (PDPA Compliance)',
+    privacyLine2: '2. ข้อมูล GPS และเบอร์โทรศัพท์ของคุณจะถูกใช้เพื่อการจับคู่และเดินทางไปให้ความช่วยเหลือของช่างเท่านั้น',
+    privacyLine3: '3. ข้อมูลบัตรและประวัติการชำระเงินจะถูกจัดเก็บด้วยมาตรฐานความปลอดภัย SSL Encrypted ไม่มีการเปิดเผยแก่บุคคลภายนอก',
+    notificationsTitle: 'การแจ้งเตือน',
+    markAllReadBtn: 'ทำเครื่องหมายว่าอ่านทั้งหมด',
+    noNotificationsYet: 'ยังไม่มีการแจ้งเตือน',
+    appSettingsTitle: 'ตั้งค่าแอปพลิเคชัน',
+    notificationsSectionLabel: 'การแจ้งเตือน',
+    notificationSoundLabel: 'เสียงแจ้งเตือน',
+    vibrationLabel: 'การสั่นเตือน',
+    displaySectionLabel: 'การแสดงผล',
+    darkModeLabel: 'โหมดมืด (Dark Mode)',
+    manageMyAccount: 'จัดการบัญชีของฉัน',
+    deleteAccountRequestToast: 'คำขอลบบัญชีถูกส่งแล้ว ทีมงานจะติดต่อกลับภายใน 3 วันทำการ',
+    deleteAccountBtn: 'ลบบัญชีผู้ใช้งาน',
+    helpCenterTitle: 'ศูนย์ช่วยเหลือ / คำถามที่พบบ่อย',
+    emergencyHotlineBtn: 'โทรสายด่วนฉุกเฉิน 1176',
+    faqQ1: 'เรียกรถสไลด์แล้วช่างมาถึงภายในกี่นาที?',
+    faqA1: 'โดยเฉลี่ยช่างจะถึงจุดหมายภายใน 15-30 นาที ขึ้นอยู่กับระยะทางและสภาพการจราจร',
+    faqQ2: 'ค่าบริการคำนวณอย่างไร?',
+    faqA2: 'ระบบคำนวณตามราคากลางมาตรฐาน ETV โดยพิจารณาจากประเภทรถบริการและระยะทาง ช่างไม่สามารถเรียกเก็บเกินราคาที่ระบบแจ้งได้',
+    faqQ3: 'ยกเลิกคำขอได้หรือไม่?',
+    faqA3: 'ยกเลิกได้ก่อนช่างออกเดินทาง หากยกเลิกหลังช่างออกเดินทางแล้วอาจมีค่าธรรมเนียมตามเงื่อนไขการให้บริการ',
+    faqQ4: 'ชำระเงินได้ช่องทางใดบ้าง?',
+    faqA4: 'รองรับพร้อมเพย์ (แนบสลิป), บัตรเครดิต/เดบิต และเงินสดกับช่างโดยตรง',
+    carBrandLabel: 'ยี่ห้อรถ',
+    carModelLabel: 'รุ่นรถ',
+    plateNumberLabel: 'ทะเบียนรถ',
+    platePlaceholder: 'กข 1234 กทม.',
+    saveCarBtn: 'บันทึกรถคันนี้',
+    callingTechTitle: 'กำลังโทรออกหาช่าง',
+    openPhoneAppBtn: 'เปิดแอปโทรศัพท์เพื่อโทรออก',
+    cancelBtn: 'ยกเลิก',
+    incomingCallFromTech: 'สายเรียกเข้าจากช่าง',
+    declineBtn: 'ปฏิเสธ',
+    answerBtn: 'รับสาย',
+    almostDoneTitle: 'เกือบเสร็จแล้ว!',
+    fillRemainingInfo: 'กรุณากรอกข้อมูลเพิ่มเติมให้ครบก่อนเริ่มใช้งาน',
+    firstNameLabel: 'ชื่อ',
+    firstNamePlaceholder: 'ชื่อจริง',
+    lastNamePlaceholder: 'นามสกุล',
+    phoneNumberLabel: 'เบอร์โทรศัพท์',
+    emailLabel: 'อีเมล',
+    savingEllipsis: 'กำลังบันทึก...',
+    getStartedBtn: 'เริ่มใช้งาน',
+    thankYouForReviewTitle: 'ขอบคุณสำหรับคะแนนรีวิว!',
+    thankYouForReviewMsg: 'ขอบคุณที่ให้คะแนนและใช้บริการกับเรา ความคิดเห็นของคุณช่วยให้เราพัฒนาการบริการต่อไป',
+    closeWindowBtn: 'ปิดหน้าต่าง',
+    loadingMapEllipsis: 'กำลังโหลดแผนที่...',
+    offlineBannerText: 'ขาดการเชื่อมต่ออินเทอร์เน็ต — ข้อมูลอาจไม่อัปเดตจนกว่าเน็ตจะกลับมา',
+    signingInEllipsis: 'กำลังเข้าสู่ระบบ...',
+    openingLinePageEllipsis: 'กำลังเปิดหน้า LINE...',
+    signingUpEllipsis: 'กำลังสมัครสมาชิก...',
+    newPasswordPlaceholder: 'กรอกรหัสผ่านใหม่',
+    confirmNewPasswordPlaceholder: 'กรอกรหัสผ่านใหม่อีกครั้ง',
+    selectServiceTypePrefix: 'เลือกประเภทรถบริการ',
+    yourVehicleTypePrefix: 'ประเภทรถของท่าน',
+    carCategorySedanOption: 'รถเก๋ง (Sedan / Hatchback)',
+    carCategoryEvOption: 'รถไฟฟ้า (EV / Hybrid)',
+    carCategoryPickupOption: 'รถกระบะ (Pickup Truck)',
+    carCategorySuvOption: 'รถ SUV / รถตู้ (Van)'
   },
   CN: {
     login: '登录',
@@ -453,7 +930,240 @@ const translations = {
     pinNew: '重新定位',
     nearestGarage: '最近的维修中心（自动）',
     liveGPS: '实时 GPS',
-    emergencyTermsButton: '阅读紧急服务条款'
+    emergencyTermsButton: '阅读紧急服务条款',
+    navHome: '首页',
+    navRequest: '呼叫拖车',
+    navHotline: '热线',
+    navHistory: '记录',
+    navProfile: '我的',
+    issueBreakdown: '车辆故障',
+    issueBattery: '电瓶没电',
+    issueTire: '轮胎爆胎',
+    issueFuel: '燃油耗尽',
+    issueOther: '其他',
+    describeIssueTitle: '请描述故障 / 遇到的问题',
+    reporterInfoTitle: '报案人信息',
+    reporterNameLabel: '报案人姓名：',
+    reporterPhoneLabel: '电话号码：',
+    towTypeSlide: '平板拖车 (Slide Tow)',
+    towTypeLift: '吊臂拖车 (Lift Tow)',
+    serviceReceiveTitle: '将提供的服务',
+    noTowNeededTag: '无需拖车',
+    jumpStartService: '搭电服务',
+    tireChangeService: '换胎/补胎服务',
+    fuelDeliveryService: '送油上门服务',
+    noTowDefaultMsg: '技师将在现场直接完成维修，无需拖车',
+    techOnBreak: '技师暂时休息中',
+    techOffline: '技师离线（信号中断）',
+    techEnRoute: '正在赶往您的位置',
+    techLoading: '正在将车辆装上拖车',
+    techOnSite: '正在现场维修',
+    techToGarage: '正在将车送往维修厂',
+    techCompleted: '任务已完成',
+    techWorking: '技师正在处理中',
+    techHeadingToScene: '技师正在赶往事故地点',
+    techLoadingEllipsis: '正在将车辆装上拖车...',
+    techOnSiteEllipsis: '技师正在现场维修...',
+    techToGarageDest: '正在将车送往目的地维修厂',
+    techRepairDone: '维修已完成',
+    etaWithinLabel: '预计到达时间',
+    currentStatusLabel: '当前状态',
+    etaApprox: '约 {min} 分钟',
+    arrivedLoading: '技师已到达现场，正在将车辆装上拖车',
+    arrivedOnSite: '技师已到达现场，正在维修',
+    techLabelLift: '吊臂拖车技师',
+    techLabelSlide: '平板拖车技师',
+    techLabelGeneric: '技师',
+    techCountUnit: '人',
+    choosePaymentChannel: '选择支付方式',
+    promptpayTitle: 'PromptPay / 扫描二维码',
+    promptpaySubtitle: '转账后在应用内上传付款凭证',
+    creditCardTitle: '信用卡 / 借记卡 (Credit/Debit Card)',
+    creditCardSubtitle: '自动从已保存的卡片扣款',
+    cashTitle: '现金 (Cash Payment)',
+    cashSubtitle: '直接向技师现场付款',
+    creditCardShort: '信用卡 /',
+    debitCardShort: '借记卡',
+    cashShort: '现金',
+    savedCardsTitle: '已保存的卡片',
+    addNewCard: '添加新卡',
+    primaryBadge: '默认',
+    paymentSecurityTitle: '支付安全',
+    paymentSecurityDesc: '所有支付信息均采用国际安全标准加密（SSL加密），100%安全',
+    qrCompanyAlt: '公司PromptPay二维码',
+    qrCompanyCaption: 'DTC Service 公司 PromptPay 二维码',
+    qrScanInstructions: '扫描上方二维码付款，然后在下方上传付款凭证以确认',
+    supportedFileTypes: '支持 JPG、PNG 格式文件',
+    etvPriceHeading: 'ETV标准价格',
+    totalServicePrice: '服务总费用：',
+    gpsRequiredWarning: '请先在上方标记事故地点GPS位置，才能呼叫技师',
+    slipRequiredWarning: '请先在"支付方式"标签页上传付款凭证，才能呼叫技师',
+    serviceHistoryHeading: '服务历史记录',
+    totalItemsPrefix: '共',
+    totalItemsSuffix: '项',
+    historyDateLabel: '日期：',
+    historyCarTypeLabel: '车辆类型：',
+    historyLocationLabel: '地点：',
+    historyTechLabel: '负责技师：',
+    netPaidLabel: '实付金额',
+    reportIssueBtn: '举报问题',
+    historyStatusCompleted: '已完成',
+    historyStatusInProgress: '进行中',
+    findingNearestTech: '正在为您寻找最近的技师...',
+    waitingTechAccept: '等待技师接单，接单后地图将自动打开',
+    cancellingEllipsis: '正在取消...',
+    cancelRequestBtn: '取消呼叫',
+    activeStatusBadge: '进行中 (Active)',
+    viewLiveTrackingMap: '查看实时追踪地图',
+    mechanicLabelShort: '技师：',
+    waitingGarageSearch: '等待GPS定位以搜索附近维修厂',
+    searchingNearbyTechs: '正在搜索您附近的可用技师...',
+    nearbyTechsFound: '附近有 {count} 位技师可用，最近约 {distance} 公里',
+    noNearbyTechsFallback: '目前附近暂无可用技师，但发出请求后系统仍会持续为您寻找',
+    noTowRepairNote: '技师将在现场完成维修，无需拖车到维修厂',
+    approxLocationSuffix: '（大概位置）',
+    serviceFeeLabel: '服务费',
+    paymentMethodLabel: '支付方式',
+    statusLabel: '状态',
+    paymentMethodTransfer: 'PromptPay / 转账',
+    techConfirmedPayment: '技师已确认收款',
+    waitingTechVerify: '等待技师确认',
+    viewEnlargedImage: '查看大图',
+    creditAutoChargeNote: '系统将自动从已保存的卡片扣款，无需上传凭证',
+    cashPayDirectNote: '直接向技师现场付款，无需上传凭证',
+    promptpayAfterAcceptNote: '技师接单后，您可以在追踪页面扫描二维码并上传付款凭证',
+    sendSlipBtn: '发送凭证',
+    kmUnit: '公里',
+    jobsUnit: '单',
+    cardDetailsRequiredErr: '请填写完整的卡片信息',
+    carDetailsRequiredErr: '请填写完整的车辆信息',
+    approxLocationSetToast: '已使用大概位置，请尽量重新标记准确的事故地点',
+    slipUploadedToast: '付款凭证已发送，等待技师确认',
+    slipUploadFailedToast: '上传凭证失败，请在历史记录页面重新上传',
+    setPasswordErr: '请设置密码',
+    passwordInvalidErr: '密码不符合要求',
+    regConfirmPasswordRequiredErr: '请确认密码',
+    serverConnectFailedToast: '连接服务器失败，请检查网络连接后重试',
+    serverConnectFailedErr: '连接服务器失败，请重试',
+    emailAlreadyUsedErr: '该邮箱已被注册',
+    signupFailedErr: '注册失败，请重试',
+    loginInvalidErr: '邮箱或密码不正确，或尚未注册',
+    lineOpenFailedToast: '无法打开LINE登录页面，请重试',
+    loginSuccessWelcome: '登录成功，欢迎',
+    lineLoginFailedToast: 'LINE登录失败，请重试',
+    surnameRequiredErr: '请输入姓氏',
+    phoneRequiredErr: '请输入电话号码',
+    emailRequiredLineErr: '请输入邮箱（LINE未提供邮箱信息）',
+    lineSignupSuccessWelcome: 'LINE注册成功，欢迎',
+    saveFailedTryAgainErr: '保存失败，请重试',
+    passwordMinLengthErr: '密码长度至少需要6个字符',
+    jobCreateFailedToast: '请求失败：系统未能创建工单（create_job_priced未返回工单信息），请重试或联系客服',
+    submitFailedPrefix: '提交失败：',
+    reportIssuePrompt: '请简要描述此工单遇到的问题（例如：技师严重迟到、行为不当）：',
+    reportSentToast: '问题报告已发送，团队将进行审核',
+    reportFailedToast: '报告发送失败（该工单可能是系统中已不存在的旧数据）',
+    slipReattachedToast: '新凭证已上传，等待技师再次确认',
+    slipReattachFailedToast: '重新上传凭证失败，请重试',
+    techAcceptedNotif: '已接单，正在赶来为您服务',
+    techArrivedToast: '技师已到达事故地点',
+    techLoadingCarToast: '技师正在将车辆装上拖车',
+    carLoadedHeadingToGarageToast: '装车完成，正在将车送往目的地维修厂',
+    cancelJobSuccessToast: '呼叫已成功取消',
+    cancelJobFailedToast: '取消失败，可能刚好有技师接单，请刷新页面重试',
+    tapToChoosePlateSubtitle: '点击选择服务类型并发送您的位置',
+    updateBtn: '更新',
+    locationNotFoundTap: '未找到您的位置 — 点击重试',
+    useApproxLocationInstead: '改用大概位置',
+    backToListBtn: '返回列表',
+    slipRejectedByTech: '技师报告凭证有误',
+    reviewSlipAndReattach: '请再次核对转账金额，并在下方重新上传凭证',
+    reattachSlipBtn: '重新上传凭证',
+    sendingSlipEllipsis: '正在发送凭证...',
+    resendSlipBtn: '重新发送凭证',
+    towingPlateLabel: '拖车车牌号',
+    techPhoneLabel: '技师电话号码',
+    callTechBtn: '致电技师',
+    chatBtn: '聊天',
+    onlinePlateStatus: '在线 • 车牌',
+    chatInputPlaceholder: '输入消息...',
+    addNewCardTitle: '添加新的信用卡 / 借记卡',
+    nameOnCard: '卡片持有人姓名',
+    cardNumberLabel: '卡号（16位）',
+    expiryLabel: '有效期（MM/YY）',
+    cvcLabel: 'CVC / CVV 安全码',
+    saveCardBtn: '保存卡片',
+    jobCompletedTitle: '服务已完成！',
+    jobCompletedSub: '技师已到达目的地维修厂，请为本次服务评分',
+    serviceFeeSummaryLabel: '费用汇总',
+    ratingLabels: '很差,不满意,一般,好,非常好！',
+    reviewFeedbackPlaceholder: '写下对技师的建议或称赞（选填）...',
+    submitReviewBtn: '提交评价并结束工单',
+    sendingToNearestTechLoading: '系统正在为您寻找最近的拖车技师...',
+    termsLine1: '1. DTC智能拖车服务的拖车及道路救援服务条款',
+    termsLine2: '2. 用户须如实提供事故地点及车辆品牌/型号等详细信息',
+    termsLine3: '3. 服务费用按ETV标准价格计算，技师不得收取超出规定的费用',
+    termsLine4: '4. 技师出发后取消请求可能会根据条款收取相应费用',
+    privacyLine1: '1. 我们重视您的隐私及个人数据保护（符合PDPA规定）',
+    privacyLine2: '2. 您的GPS位置及电话号码仅用于匹配及派遣技师为您提供协助',
+    privacyLine3: '3. 卡片及付款记录信息将以SSL加密等安全标准存储，不会向第三方披露',
+    notificationsTitle: '通知',
+    markAllReadBtn: '全部标记为已读',
+    noNotificationsYet: '暂无通知',
+    appSettingsTitle: '应用设置',
+    notificationsSectionLabel: '通知',
+    notificationSoundLabel: '通知提示音',
+    vibrationLabel: '震动提醒',
+    displaySectionLabel: '显示',
+    darkModeLabel: '深色模式（Dark Mode）',
+    manageMyAccount: '管理我的账户',
+    deleteAccountRequestToast: '账户删除请求已发送，团队将在3个工作日内与您联系',
+    deleteAccountBtn: '删除账户',
+    helpCenterTitle: '帮助中心 / 常见问题',
+    emergencyHotlineBtn: '拨打紧急热线 1176',
+    faqQ1: '呼叫拖车后，技师多久能到达？',
+    faqA1: '平均而言，技师会在15-30分钟内到达，具体取决于距离和路况',
+    faqQ2: '服务费用如何计算？',
+    faqA2: '系统根据ETV标准价格，综合考虑服务车型和距离计算费用，技师不得收取超出系统显示的费用',
+    faqQ3: '可以取消请求吗？',
+    faqA3: '在技师出发前可以取消。技师出发后取消可能会根据服务条款收取相应费用',
+    faqQ4: '支持哪些支付方式？',
+    faqA4: '支持PromptPay（上传凭证）、信用卡/借记卡，以及直接向技师支付现金',
+    carBrandLabel: '车辆品牌',
+    carModelLabel: '车辆型号',
+    plateNumberLabel: '车牌号',
+    platePlaceholder: '例：กข 1234 曼谷',
+    saveCarBtn: '保存此车辆',
+    callingTechTitle: '正在致电技师',
+    openPhoneAppBtn: '打开电话应用拨打',
+    cancelBtn: '取消',
+    incomingCallFromTech: '技师来电',
+    declineBtn: '拒接',
+    answerBtn: '接听',
+    almostDoneTitle: '快完成了！',
+    fillRemainingInfo: '请填写剩余信息后即可开始使用',
+    firstNameLabel: '名字',
+    firstNamePlaceholder: '名字',
+    lastNamePlaceholder: '姓氏',
+    phoneNumberLabel: '电话号码',
+    emailLabel: '邮箱',
+    savingEllipsis: '正在保存...',
+    getStartedBtn: '开始使用',
+    thankYouForReviewTitle: '感谢您的评分！',
+    thankYouForReviewMsg: '感谢您的评分与使用，您的意见将帮助我们不断改进服务',
+    closeWindowBtn: '关闭窗口',
+    loadingMapEllipsis: '正在加载地图...',
+    offlineBannerText: '网络连接已断开 — 数据可能无法更新，直至网络恢复',
+    signingInEllipsis: '登录中...',
+    openingLinePageEllipsis: '正在打开LINE页面...',
+    signingUpEllipsis: '注册中...',
+    newPasswordPlaceholder: '请输入新密码',
+    confirmNewPasswordPlaceholder: '请再次输入新密码',
+    selectServiceTypePrefix: '选择拖车服务类型',
+    yourVehicleTypePrefix: '您的车辆类型',
+    carCategorySedanOption: '轿车 (Sedan / Hatchback)',
+    carCategoryEvOption: '电动车 (EV / Hybrid)',
+    carCategoryPickupOption: '皮卡车 (Pickup Truck)',
+    carCategorySuvOption: 'SUV / 厢式车 (Van)'
   },
 };
 
@@ -671,18 +1381,56 @@ export default function App() {
   // State ข้อความแจ้งเตือนในแอป (แทน alert() ของเบราว์เซอร์ที่หลุดออกนอกกรอบมือถือ)
   const [appToast, setAppToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
+  // สถานะเน็ตของเครื่อง — แอปนี้พึ่ง Supabase Realtime หนักมาก (แผนที่, สถานะช่าง, แชท) ถ้าเน็ต
+  // หลุดกลางทางเดิมไม่มีอะไรบอกลูกค้าเลยว่าทำไมหน้าจอไม่ขยับ เพิ่มแถบเตือนง่ายๆ จาก
+  // navigator.onLine + online/offline event ให้อย่างน้อยรู้ว่าเน็ตหลุดจริง ไม่ใช่แอปค้าง
+  const [isOnline, setIsOnline] = useState<boolean>(true);
+  useEffect(() => {
+    if (typeof navigator !== 'undefined') setIsOnline(navigator.onLine);
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
   // State ป๊อปอัพขอบคุณหลังส่งรีวิวสำเร็จ (แสดงในกรอบมือถือ แทน alert())
   const [showReviewThanksModal, setShowReviewThanksModal] = useState<boolean>(false);
 
   const [currentBannerIndex, setCurrentBannerIndex] = useState<number>(0);
   const [expandedBannerUrl, setExpandedBannerUrl] = useState<string | null>(null);
 
-  const [techStats] = useState({
-    online: 18,
-    working: 7,
-    breakTime: 3,
-    offline: 4
+  // เดิมเป็นเลขปลอมคงที่ (useState({ online: 18, ... }) ไม่เคยมี setter เรียกเลย ค้างตัวเลข
+  // เดิมตลอดชีวิตแอป) เปลี่ยนมาดึงของจริงผ่าน getTechStatusCounts() (RPC get_tech_status_counts)
+  // ตอนโหลดหน้าแรก แล้วฟัง subscribeTechStatusCounts() เพื่อ refetch ใหม่ทุกครั้งที่มีช่างคนไหน
+  // เปลี่ยนสถานะ (ไม่ push ตัวเลขตรงๆ มาเพราะ payload realtime มีแค่ 1 แถวที่เปลี่ยน ให้ DB
+  // นับผลรวมใหม่ทั้งหมดให้แม่นกว่า)
+  const [techStats, setTechStats] = useState({
+    online: 0,
+    working: 0,
+    breakTime: 0,
+    offline: 0,
   });
+
+  useEffect(() => {
+    let cancelled = false;
+    const refetchTechStats = () => {
+      getTechStatusCounts()
+        .then((counts) => {
+          if (!cancelled) setTechStats(counts);
+        })
+        .catch((err) => console.error('Error fetching tech status counts:', err));
+    };
+    refetchTechStats();
+    const unsubscribe = subscribeTechStatusCounts(refetchTechStats);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
 
   const [registerForm, setRegisterForm] = useState({
     name: '',
@@ -724,6 +1472,18 @@ export default function App() {
   // เดิม) — ตั้งค่าตอนสมัคร/ล็อกอินสำเร็จ ใช้ยืนยันว่ามี session จริงอยู่ไหม
   const [customerProfile, setCustomerProfile] = useState<CustomerProfile | null>(null);
   const [authSubmitting, setAuthSubmitting] = useState(false);
+
+  // ---- LINE Login (OAuth ผ่าน Supabase custom:line) ----
+  // isLineAuthLoading: true ตั้งแต่กดปุ่ม LINE จนกว่าเบราว์เซอร์ระบบจะเปิดขึ้น/ปิดลง
+  // showLineCompleteProfile: true เมื่อ LINE OAuth สำเร็จแต่ยังไม่เคยมีแถวใน customers
+  //   (ผู้ใช้ LINE ใหม่ครั้งแรก) ต้องกรอกนามสกุล/เบอร์โทร (และอีเมลถ้า LINE ไม่ได้ให้มา)
+  //   ก่อนถึงจะสร้างโปรไฟล์จริงได้ เพราะ ID token ของ LINE ไม่มีเบอร์โทร
+  const [isLineAuthLoading, setIsLineAuthLoading] = useState(false);
+  const [showLineCompleteProfile, setShowLineCompleteProfile] = useState(false);
+  const [lineOAuthUserId, setLineOAuthUserId] = useState<string>('');
+  const [lineCompleteForm, setLineCompleteForm] = useState({ name: '', surname: '', phone: '', email: '' });
+  const [lineCompleteErr, setLineCompleteErr] = useState<{ surname?: string; phone?: string; email?: string }>({});
+  const [lineCompleteSubmitting, setLineCompleteSubmitting] = useState(false);
   const [emailError, setEmailError] = useState<boolean>(false);
   const [passwordError, setPasswordError] = useState<string>('');
 
@@ -742,6 +1502,30 @@ export default function App() {
   const [showResetSuccessModal, setShowResetSuccessModal] = useState<boolean>(false);
 
   const t = translations[lang];
+
+  // แปลง locale ของแอป (Language) เป็น BCP-47 locale tag สำหรับ Intl API
+  // - TH / EN → เลขอาราบิก (0-9) ปกติ (th-TH ใน browser ใช้เลขอาราบิกเป็นค่าเริ่มต้นอยู่แล้ว
+  //   ไม่ใช่เลขไทย ๑๒๓ ดังนั้นไม่ต้องกำหนด numbering system เพิ่ม)
+  // - CN → ใช้ตัวเลขจีน (〇一二三四五六七八九) ผ่าน Unicode extension -u-nu-hanidec
+  const localeMap: Record<Language, string> = {
+    TH: 'th-TH',
+    EN: 'en-US',
+    CN: 'zh-Hans-CN',
+  };
+
+  // ใช้แปลงตัวเลข (ราคา, จำนวน ฯลฯ) ให้ตรงกับภาษาที่เลือกอยู่ตอนนี้ (lang) แทนการเรียก
+  // .toLocaleString() เปล่าๆ ซึ่งจะใช้ locale ของเบราว์เซอร์/อุปกรณ์แทน ไม่ใช่ภาษาที่เลือกในแอป
+  const formatNumber = (value: number, options?: Intl.NumberFormatOptions) => {
+    const localeTag = lang === 'CN' ? `${localeMap.CN}-u-nu-hanidec` : localeMap[lang];
+    return new Intl.NumberFormat(localeTag, options).format(value);
+  };
+
+  // ใช้แปลงวันที่ให้ตรงกับภาษาที่เลือก แทนการ hardcode 'th-TH' แบบเดิม
+  const formatDate = (date: Date, options: Intl.DateTimeFormatOptions = { day: 'numeric', month: 'short', year: 'numeric' }) => {
+    const localeTag = lang === 'CN' ? `${localeMap.CN}-u-nu-hanidec` : localeMap[lang];
+    return date.toLocaleDateString(localeTag, options);
+  };
+
   // เปลี่ยนภาษาแบบรวมศูนย์ + จำค่าภาษาไว้ในเครื่อง
   const handleLanguageChange = (newLang: Language) => {
     setLang(newLang);
@@ -765,7 +1549,7 @@ export default function App() {
   const handleAddCard = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newCardNumber || !newCardExp || !newCardCvc) {
-      setAppToast({ message: 'กรุณากรอกข้อมูลบัตรให้ครบถ้วน', type: 'error' });
+      setAppToast({ message: t.cardDetailsRequiredErr, type: 'error' });
       return;
     }
     const last4 = newCardNumber.slice(-4) || '9999';
@@ -857,11 +1641,25 @@ export default function App() {
     );
     const distanceKm = Number(distanceBetween(nearest).toFixed(1));
     return {
-      label: `${nearest.name} (${distanceKm.toFixed(1)} กม.)`,
+      label: `${nearest.name} (${distanceKm.toFixed(1)} ${t.kmUnit})`,
       distanceKm,
       lat: nearest.lat,
       lng: nearest.lng,
     };
+  };
+
+  // ค่า distanceKm ตอนแรกมาจาก Haversine (เส้นตรง) ใน findNearestGarage ซึ่งใช้เลือกอู่
+  // ที่ใกล้สุดได้พอ แต่ไม่แม่นพอจะเอาไปคิดราคา — ฟังก์ชันนี้เรียก compute-route (OSRM) เพื่อ
+  // เอาระยะทางถนนจริงจากจุดเกิดเหตุไปอู่มาแทนที่ ทำงานแบบ fire-and-forget หลัง UI แสดงค่า
+  // ประมาณไปก่อนแล้ว (ไม่บล็อกผู้ใช้รอ) ถ้า compute-route ล่ม/เน็ตหลุด ค่า Haversine เดิม
+  // จะยังอยู่เป็น fallback ต่อไป ไม่มีอะไรพัง
+  const refineDistanceWithRealRoute = async (
+    pickup: { lat: number; lng: number },
+    garage: { lat: number; lng: number }
+  ) => {
+    const route = await computeRoute(pickup, garage);
+    if (!route) return;
+    setTowingRequest(prev => ({ ...prev, distanceKm: Number(route.distanceKm.toFixed(1)) }));
   };
 
   const handleFetchLiveLocation = async (): Promise<boolean> => {
@@ -881,6 +1679,7 @@ export default function App() {
         nearestGarageLng: nearestGarage.lng,
         distanceKm: nearestGarage.distanceKm
       }));
+      refineDistanceWithRealRoute(coords, { lat: nearestGarage.lat, lng: nearestGarage.lng });
       return true;
     } catch (error: any) {
       if (error?.code === -1) {
@@ -924,6 +1723,7 @@ export default function App() {
         nearestGarageLng: nearestGarage.lng,
         distanceKm: nearestGarage.distanceKm
       }));
+      refineDistanceWithRealRoute(coords, { lat: nearestGarage.lat, lng: nearestGarage.lng });
       setLocationError('');
 
       const mapsUrl = `https://maps.google.com/?q=${coords.lat},${coords.lng}`;
@@ -960,14 +1760,15 @@ export default function App() {
     setLiveCoords(approxCoords);
     setTowingRequest(prev => ({
       ...prev,
-      gpsLocation: `${formatGpsLocation(approxCoords.lat, approxCoords.lng)} (ตำแหน่งโดยประมาณ)`,
+      gpsLocation: `${formatGpsLocation(approxCoords.lat, approxCoords.lng)} ${t.approxLocationSuffix}`,
       nearestGarage: nearestGarage.label,
       nearestGarageLat: nearestGarage.lat,
       nearestGarageLng: nearestGarage.lng,
       distanceKm: nearestGarage.distanceKm
     }));
+    refineDistanceWithRealRoute(approxCoords, { lat: nearestGarage.lat, lng: nearestGarage.lng });
     setLocationError('');
-    setAppToast({ message: 'ใช้ตำแหน่งโดยประมาณแล้ว กรุณาปักหมุดแก้ไขให้ตรงจุดเกิดเหตุอีกครั้งหากทำได้', type: 'success' });
+    setAppToast({ message: t.approxLocationSetToast, type: 'success' });
   };
 
   // ฟังก์ชันจัดการการแจ้งเตือน
@@ -985,7 +1786,7 @@ export default function App() {
   const handleAddCar = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newCarBrand.trim() || !newCarModel.trim() || !newCarPlate.trim()) {
-      setAppToast({ message: 'กรุณากรอกข้อมูลรถให้ครบถ้วน', type: 'error' });
+      setAppToast({ message: t.carDetailsRequiredErr, type: 'error' });
       return;
     }
     setSavedCars(prev => [
@@ -1100,10 +1901,27 @@ export default function App() {
         slipUrl: publicUrlData.publicUrl,
       });
 
-      setAppToast({ message: 'ส่งสลิปโอนเงินเรียบร้อย รอช่างตรวจสอบ', type: 'success' });
+      // อัปเดต state myPayment ทันที (optimistic) ไม่ต้องรอ realtime/poll กลับมา — การ์ด QR
+      // ในหน้าติดตามงานเช็คเงื่อนไข !myPayment?.slip_url อยู่ จะได้ซ่อนได้ทันทีที่ส่งสำเร็จ
+      setMyPayment((prev) =>
+        prev
+          ? { ...prev, slip_url: publicUrlData.publicUrl, status: 'pending' }
+          : {
+              id: jobId,
+              slip_url: publicUrlData.publicUrl,
+              amount: towingRequest.calculatedEtvPrice,
+              payment_method: 'transfer',
+              status: 'pending',
+            }
+      );
+      setSlipImage(null);
+      setSlipFile(null);
+      if (slipFileInputRef.current) slipFileInputRef.current.value = '';
+
+      setAppToast({ message: t.slipUploadedToast, type: 'success' });
     } catch (err) {
       console.error('Error uploading payment slip:', err);
-      setAppToast({ message: 'อัปโหลดสลิปไม่สำเร็จ กรุณาแนบสลิปใหม่ในหน้าประวัติงาน', type: 'error' });
+      setAppToast({ message: t.slipUploadFailedToast, type: 'error' });
     } finally {
       setIsUploadingSlip(false);
     }
@@ -1138,8 +1956,15 @@ export default function App() {
 
     // บันทึกรายการล่าสุดเข้าประวัติการใช้บริการ
     const now = new Date();
-    const dateStr = now.toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: 'numeric' });
-    const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')} น.`;
+    const dateStr = formatDate(now);
+    const hh = now.getHours().toString().padStart(2, '0');
+    const mm = now.getMinutes().toString().padStart(2, '0');
+    // ต่อท้าย "น." (นาฬิกา) เฉพาะภาษาไทยเท่านั้น ภาษาอื่นแสดงแค่เวลาเปล่าๆ
+    const timeStr = lang === 'TH'
+      ? `${formatNumber(now.getHours()).padStart(2, '0')}:${formatNumber(now.getMinutes()).padStart(2, '0')} น.`
+      : lang === 'CN'
+        ? `${formatNumber(now.getHours())}:${formatNumber(now.getMinutes())}`
+        : `${hh}:${mm}`;
     const newHistoryItem = {
       id: `JOB-${Date.now().toString().slice(-8)}`,
       date: dateStr,
@@ -1338,18 +2163,18 @@ export default function App() {
     if (!registerForm.email.trim()) { setRegEmailErr(true); hasError = true; }
 
     if (!regPassword.trim()) {
-      setRegPasswordErr('กรุณาตั้งรหัสผ่าน');
+      setRegPasswordErr(t.setPasswordErr);
       hasError = true;
     } else if (!regPasswordChecks.length || !regPasswordChecks.uppercase || !regPasswordChecks.numberSpecial) {
-      setRegPasswordErr('รหัสผ่านไม่ตรงตามเงื่อนไขที่กำหนด');
+      setRegPasswordErr(t.passwordInvalidErr);
       hasError = true;
     }
 
     if (!regConfirmPassword.trim()) {
-      setRegConfirmPasswordErr('กรุณายืนยันรหัสผ่าน');
+      setRegConfirmPasswordErr(t.regConfirmPasswordRequiredErr);
       hasError = true;
     } else if (regPassword.trim() && regConfirmPassword !== regPassword) {
-      setRegConfirmPasswordErr('รหัสผ่านไม่ตรงกัน');
+      setRegConfirmPasswordErr(t.passwordMismatchErr);
       hasError = true;
     }
 
@@ -1382,9 +2207,9 @@ export default function App() {
       const msg: string = err?.message || '';
 
       if (msg === '__TIMEOUT__') {
-        setAppToast({ message: 'เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ กรุณาตรวจสอบสัญญาณอินเทอร์เน็ตแล้วลองใหม่อีกครั้ง', type: 'error' });
+        setAppToast({ message: t.serverConnectFailedToast, type: 'error' });
         setRegEmailErr(true);
-        setRegEmailErrMsg('เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง');
+        setRegEmailErrMsg(t.serverConnectFailedErr);
         return;
       }
 
@@ -1392,10 +2217,10 @@ export default function App() {
       // "already exists" ปนมา — เช็คแบบ loose ไว้กันเวอร์ชัน error message เปลี่ยน
       if (/already/i.test(msg)) {
         setRegEmailErr(true);
-        setRegEmailErrMsg('อีเมลนี้ถูกใช้สมัครสมาชิกไปแล้ว');
+        setRegEmailErrMsg(t.emailAlreadyUsedErr);
       } else {
         setRegEmailErr(true);
-        setRegEmailErrMsg(msg || 'สมัครสมาชิกไม่สำเร็จ กรุณาลองใหม่อีกครั้ง');
+        setRegEmailErrMsg(msg || t.signupFailedErr);
       }
     } finally {
       setAuthSubmitting(false);
@@ -1445,27 +2270,122 @@ export default function App() {
       const msg: string = err?.message || '';
 
       if (msg === '__TIMEOUT__') {
-        setAppToast({ message: 'เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ กรุณาตรวจสอบสัญญาณอินเทอร์เน็ตแล้วลองใหม่อีกครั้ง', type: 'error' });
+        setAppToast({ message: t.serverConnectFailedToast, type: 'error' });
         return;
       }
 
       // Supabase ไม่บอกแยกว่า "อีเมลไม่พบ" หรือ "รหัสผ่านผิด" (กันเดาอีเมลถูกจากข้อความ error)
       // เลยแสดงข้อความรวมที่ช่องรหัสผ่านเหมือนกันทั้งสองกรณี
       setEmailError(true);
-      setPasswordError('อีเมลหรือรหัสผ่านไม่ถูกต้อง หรือยังไม่เคยสมัครสมาชิก');
+      setPasswordError(t.loginInvalidErr);
     } finally {
       setAuthSubmitting(false);
     }
   };
 
-  // เดิมปุ่มนี้ปลอมโปรไฟล์ ('Line User' / 'user.line@line.me' เหมือนกันทุกคน) แล้วเด้ง
-  // เข้าแอปทันทีโดยไม่เคยสร้างบัญชีจริงใน Supabase เลย — ข้อมูลเลยอยู่แค่ใน React state
-  // ของเครื่องนั้น พอถอนแอปแล้วลงใหม่จึงหายหมดต้องสมัครใหม่ทุกครั้ง (ต่างจากฝั่งช่างที่
-  // ปุ่มนี้ยังไม่ผูก OAuth จริงเหมือนกัน แต่บอกผู้ใช้ตรงๆ ว่ายังไม่เปิดใช้งาน แทนที่จะ
-  // แกล้งล็อกอินให้เข้าได้) — ยังไม่มีการต่อ LINE Login API จริงในระบบนี้ เปลี่ยนเป็นขึ้น
-  // toast บอกตรงๆ แบบเดียวกับฝั่งช่างแทน จนกว่าจะทำ LINE OAuth จริงแล้วผูกกับ Supabase Auth
-  const handleLineSelect = () => {
-    setAppToast({ message: 'ฟีเจอร์นี้ยังไม่เปิดใช้งาน กรุณาสมัครสมาชิกด้วยอีเมลไปก่อน', type: 'error' });
+  // กดปุ่ม "LINE" — เปิดหน้า LINE consent ในเบราว์เซอร์ระบบผ่าน Supabase OAuth (custom:line)
+  // จริง ผลลัพธ์ (สำเร็จ/ไม่สำเร็จ/ผู้ใช้ใหม่ต้องกรอกโปรไฟล์เพิ่ม) จะมาที่ useEffect
+  // ที่ลงทะเบียน registerLineAuthListener ด้านล่าง เพราะการตอบกลับมาผ่าน deep link
+  // แยกรอบ ไม่ใช่ return value ตรงจากฟังก์ชันนี้
+  const handleLineSelect = async () => {
+    setIsLineAuthLoading(true);
+    try {
+      await signInWithLine('customer');
+      // ไม่ setIsLineAuthLoading(false) ตรงนี้ — ปล่อยให้ค้าง loading ไว้จนกว่า
+      // listener จะได้ผลลัพธ์กลับมา (สำเร็จ/ผิดพลาด) เพราะผู้ใช้กำลังอยู่ในเบราว์เซอร์ระบบ
+    } catch (err: any) {
+      setIsLineAuthLoading(false);
+      setAppToast({ message: err?.message || t.lineOpenFailedToast, type: 'error' });
+    }
+  };
+
+  // ผลลัพธ์หลัง LINE OAuth สำเร็จ (มี Supabase session แล้ว) — เช็คว่าเคยกรอกโปรไฟล์
+  // ลูกค้า (ตาราง customers) ไว้หรือยัง ถ้าเคย = ล็อกอินสำเร็จเข้าแอปได้เลย (เหมือน
+  // handleLoginSubmit) ถ้ายัง = เป็นผู้ใช้ LINE ใหม่ ต้องโชว์ฟอร์ม "กรอกข้อมูลให้ครบ" ก่อน
+  const handleLineAuthSuccess = async (
+    userId: string,
+    claims: { name?: string; email?: string; picture?: string }
+  ) => {
+    try {
+      const existingProfile = await getCustomerProfileIfExists(userId);
+      if (existingProfile) {
+        setCustomerProfile(existingProfile);
+        setRegisterForm(prev => ({
+          ...prev,
+          name: existingProfile.name,
+          surname: existingProfile.surname,
+          phoneNumber: existingProfile.phone,
+          email: existingProfile.email,
+        }));
+        setIsLineAuthLoading(false);
+        setStep(9);
+        setAppToast({ message: `${t.loginSuccessWelcome}${existingProfile.name}`, type: 'success' });
+        return;
+      }
+
+      // ผู้ใช้ LINE ใหม่ — เปิดฟอร์มกรอกข้อมูลเพิ่ม โดย prefill ชื่อ/อีเมลจาก LINE ถ้ามีมาให้
+      setLineOAuthUserId(userId);
+      setLineCompleteForm({
+        name: claims.name || '',
+        surname: '',
+        phone: '',
+        email: claims.email || '',
+      });
+      setIsLineAuthLoading(false);
+      setShowLineCompleteProfile(true);
+    } catch (err: any) {
+      setIsLineAuthLoading(false);
+      setAppToast({ message: err?.message || t.lineLoginFailedToast, type: 'error' });
+    }
+  };
+
+  const handleLineAuthError = (message: string) => {
+    setIsLineAuthLoading(false);
+    setAppToast({ message, type: 'error' });
+  };
+
+  // ลงทะเบียนดักฟัง deep link callback จาก LINE OAuth ครั้งเดียวตอน mount หน้านี้
+  useEffect(() => {
+    const cleanup = registerLineAuthListener('customer', handleLineAuthSuccess, handleLineAuthError);
+    return cleanup;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ผู้ใช้ LINE ใหม่กดยืนยันฟอร์ม "กรอกข้อมูลให้ครบ" — สร้างแถวโปรไฟล์จริงในตาราง customers
+  // ผูกกับ auth user ที่มีอยู่แล้วจาก LINE OAuth (ไม่เรียก signUp ซ้ำ ต่างจากสมัครด้วยอีเมล)
+  const handleSubmitLineCompleteProfile = async () => {
+    const errs: { surname?: string; phone?: string; email?: string } = {};
+    if (!lineCompleteForm.surname.trim()) errs.surname = t.surnameRequiredErr;
+    if (!lineCompleteForm.phone.trim()) errs.phone = t.phoneRequiredErr;
+    if (!lineCompleteForm.email.trim()) errs.email = t.emailRequiredLineErr;
+    setLineCompleteErr(errs);
+    if (Object.keys(errs).length > 0) return;
+
+    setLineCompleteSubmitting(true);
+    try {
+      const profile = await completeCustomerProfileAfterOAuth({
+        customerId: lineOAuthUserId,
+        name: lineCompleteForm.name,
+        surname: lineCompleteForm.surname,
+        phone: lineCompleteForm.phone,
+        email: lineCompleteForm.email,
+      });
+      setCustomerProfile(profile);
+      setRegisterForm(prev => ({
+        ...prev,
+        name: profile.name,
+        surname: profile.surname,
+        phoneNumber: profile.phone,
+        email: profile.email,
+      }));
+      setShowLineCompleteProfile(false);
+      setStep(9);
+      setAppToast({ message: `${t.lineSignupSuccessWelcome}${profile.name}`, type: 'success' });
+    } catch (err: any) {
+      setAppToast({ message: err?.message || t.saveFailedTryAgainErr, type: 'error' });
+    } finally {
+      setLineCompleteSubmitting(false);
+    }
   };
 
   const handleSendCode = () => {
@@ -1510,21 +2430,21 @@ export default function App() {
     setConfirmPasswordErr('');
 
     if (!newPasswordVal.trim()) {
-      setNewPasswordErr(t.newPasswordRequiredErr || 'กรุณากรอกรหัสผ่านใหม่');
+      setNewPasswordErr(t.newPasswordRequiredErr);
       hasError = true;
     } else if (newPasswordVal.length < 6) {
-      setNewPasswordErr('รหัสผ่านต้องมีความยาวอย่างน้อย 6 ตัวอักษร');
+      setNewPasswordErr(t.passwordMinLengthErr);
       hasError = true;
     }
 
     if (!confirmPasswordVal.trim()) {
-      setConfirmPasswordErr(t.confirmPasswordRequiredErr || 'กรุณายืนยันรหัสผ่านใหม่');
+      setConfirmPasswordErr(t.confirmPasswordRequiredErr);
       hasError = true;
     }
 
     if (newPasswordVal.trim() && confirmPasswordVal.trim()) {
       if (newPasswordVal !== confirmPasswordVal) {
-        setConfirmPasswordErr(t.passwordMismatchErr || 'รหัสผ่านไม่ตรงกัน');
+        setConfirmPasswordErr(t.passwordMismatchErr);
         hasError = true;
       }
     }
@@ -1555,16 +2475,13 @@ export default function App() {
   };
 const handleConfirmTowingBooking = async () => {
     if (!liveCoords) {
-      setAppToast({ message: 'กรุณาตรึง GPS จุดเกิดเหตุก่อนเรียกช่าง', type: 'error' });
+      setAppToast({ message: t.gpsRequiredWarning, type: 'error' });
       return;
     }
 
-    // บังคับแนบสลิปก่อนเสมอถ้าเลือกจ่ายผ่าน PromptPay/QR Code — กันปัญหาช่างไปถึงหน้างานแล้ว
-    // ไม่มีหลักฐานการโอนให้ตรวจสอบเลย (เดิมแนบหรือไม่แนบก็เรียกรถได้เหมือนกัน)
-    if (selectedPaymentMethod === 'promptpay' && !slipFile) {
-      setAppToast({ message: 'กรุณาแนบสลิปการโอนเงินก่อนเรียกช่าง', type: 'error' });
-      return;
-    }
+    // แก้ตามที่ตกลงกันไว้: เรียกช่างได้ทันทีโดยไม่ต้องจ่าย/แนบสลิปก่อนอีกต่อไป — ถ้าเลือกจ่ายผ่าน
+    // PromptPay ลูกค้าจะไปสแกน QR + แนบสลิปในหน้าติดตามงานแทน หลังจากช่างกดรับงานแล้วเท่านั้น
+    // (ดูส่วน activeTab === 'activity' ด้านล่าง) ไม่บล็อกการเรียกช่างตรงนี้เหมือนเดิมอีกต่อไป
 
     try {
       // เดิม insert ตรงเข้า 'jobs' และส่ง price เอง (towingRequest.calculatedEtvPrice)
@@ -1618,7 +2535,7 @@ const handleConfirmTowingBooking = async () => {
         }, 2500);
       } else {
         setAppToast({
-          message: 'ส่งคำขอไม่สำเร็จ: ระบบไม่ได้สร้างงานจริง (create_job_priced ไม่คืนค่างานกลับมา) กรุณาลองใหม่หรือแจ้งทีมงาน',
+          message: t.jobCreateFailedToast,
           type: 'error',
         });
         return;
@@ -1629,7 +2546,7 @@ const handleConfirmTowingBooking = async () => {
       // โชว์ข้อความ error จริงจาก Supabase ในแอปเลย (ชั่วคราวเพื่อ debug บนเครื่องจริง
       // ที่เปิด chrome://inspect ไม่ได้เพราะนโยบายองค์กรบล็อกไว้)
       const detail = err?.message || err?.error_description || err?.hint || JSON.stringify(err);
-      setAppToast({ message: `ส่งข้อมูลไม่สำเร็จ: ${detail}`, type: 'error' });
+      setAppToast({ message: `${t.submitFailedPrefix} ${detail}`, type: 'error' });
     }
   };
 
@@ -1706,14 +2623,14 @@ const handleConfirmTowingBooking = async () => {
   // จริงจาก Supabase เท่านั้น (รายการประวัติเก่าที่เป็นข้อมูลตัวอย่าง เช่น 'JOB-20260210' จะ insert
   // ไม่ผ่านเพราะไม่ตรงกับ job จริงในระบบ — ครอบ try/catch ไว้กันแอปพังถ้าเจอกรณีนี้)
   const handleReportServiceIssue = async (jobId: string) => {
-    const reason = window.prompt('อธิบายปัญหาที่พบกับงานนี้สั้นๆ (เช่น ช่างมาช้าผิดปกติ, พฤติกรรมไม่เหมาะสม):');
+    const reason = window.prompt(t.reportIssuePrompt);
     if (!reason || !reason.trim()) return;
     try {
       await sendChatMessage({ jobId, sender: 'customer', text: `[REPORT] ลูกค้ารายงานปัญหา: ${reason.trim()}` });
-      setAppToast({ message: 'ส่งรายงานปัญหาแล้ว ทีมงานจะตรวจสอบให้', type: 'success' });
+      setAppToast({ message: t.reportSentToast, type: 'success' });
     } catch (err) {
       console.error('Error reporting job issue:', err);
-      setAppToast({ message: 'ส่งรายงานไม่สำเร็จ (งานนี้อาจเป็นข้อมูลเก่าที่ไม่มีอยู่ในระบบแล้ว)', type: 'error' });
+      setAppToast({ message: t.reportFailedToast, type: 'error' });
     }
   };
 
@@ -1747,7 +2664,7 @@ const handleConfirmTowingBooking = async () => {
       setReslipFile(null);
       if (reslipFileInputRef.current) reslipFileInputRef.current.value = '';
       if (reslipChatFileInputRef.current) reslipChatFileInputRef.current.value = '';
-      setAppToast({ message: 'แนบสลิปใหม่เรียบร้อย รอช่างตรวจสอบอีกครั้ง', type: 'success' });
+      setAppToast({ message: t.slipReattachedToast, type: 'success' });
 
       // แจ้งช่างเข้าแชทอัตโนมัติทันทีที่ส่งสลิปใหม่สำเร็จ พร้อมลิงก์สลิป — เดิมช่างไม่มีทางรู้เลยว่า
       // ลูกค้าส่งสลิปใหม่มาหรือยัง นอกจากเปิดหน้ารายละเอียดงานเข้าไปเช็คเอง
@@ -1760,7 +2677,7 @@ const handleConfirmTowingBooking = async () => {
       }
     } catch (err) {
       console.error('Error re-uploading payment slip:', err);
-      setAppToast({ message: 'แนบสลิปใหม่ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง', type: 'error' });
+      setAppToast({ message: t.slipReattachFailedToast, type: 'error' });
     } finally {
       setIsReuploadingSlip(false);
     }
@@ -1801,7 +2718,7 @@ const handleConfirmTowingBooking = async () => {
       setShowTrackingDetail(true);
       if (!silent) {
         setAppToast({
-          message: `ช่าง ${job.assignedTechName || 'บริการ'} รับงานของคุณแล้ว กำลังเดินทางมาหา`,
+          message: `${job.assignedTechName || t.techLabelGeneric} ${t.techAcceptedNotif}`,
           type: 'success',
         });
       }
@@ -1821,17 +2738,17 @@ const handleConfirmTowingBooking = async () => {
       case 'arrived':
         setTrackingPhase(currentIssueConfig.requiresTow ? 'loading' : 'on_site');
         setTruckProgress(50);
-        if (!silent) setAppToast({ message: 'ช่างถึงจุดเกิดเหตุแล้ว', type: 'success' });
+        if (!silent) setAppToast({ message: t.techArrivedToast, type: 'success' });
         break;
       case 'loading':
         setTrackingPhase('loading');
         setTruckProgress(50);
-        if (!silent) setAppToast({ message: 'ช่างกำลังยกรถขึ้นรถสไลด์', type: 'success' });
+        if (!silent) setAppToast({ message: t.techLoadingCarToast, type: 'success' });
         break;
       case 'delivering':
         setTrackingPhase('moving_to_green');
         setTruckProgress(75);
-        if (!silent) setAppToast({ message: 'ยกรถเสร็จแล้ว กำลังนำรถไปส่งที่อู่ปลายทาง', type: 'success' });
+        if (!silent) setAppToast({ message: t.carLoadedHeadingToGarageToast, type: 'success' });
         break;
       case 'completed':
         setTrackingPhase('completed');
@@ -1840,6 +2757,31 @@ const handleConfirmTowingBooking = async () => {
         break;
       default:
         break;
+    }
+  };
+
+  // ยกเลิกงานที่ลูกค้าเพิ่งเรียก — ทำได้เฉพาะตอนยังไม่มีช่างรับงาน (ก่อน techAccepted เป็น true
+  // เท่านั้น ตรงกับที่ RPC ฝั่ง server อนุญาต ดูคอมเมนต์ cancelJob() ใน dtc-api.ts) ปุ่มนี้จะไม่โชว์
+  // เลยถ้ามีช่างรับงานไปแล้ว เพื่อไม่ให้ลูกค้ากดแล้วเจอ error จาก RPC
+  const [isCancellingJob, setIsCancellingJob] = useState<boolean>(false);
+  const handleCancelJob = async () => {
+    if (!currentJobId || isCancellingJob) return;
+    setIsCancellingJob(true);
+    try {
+      await cancelJob(currentJobId);
+      setHasActiveBooking(false);
+      setCurrentJobId(null);
+      setTechAccepted(false);
+      setShowTrackingDetail(false);
+      setAppToast({ message: t.cancelJobSuccessToast, type: 'success' });
+    } catch (err: any) {
+      console.error('Error cancelling job:', err);
+      setAppToast({
+        message: err?.message || t.cancelJobFailedToast,
+        type: 'error',
+      });
+    } finally {
+      setIsCancellingJob(false);
     }
   };
 
@@ -1868,17 +2810,39 @@ const handleConfirmTowingBooking = async () => {
     return unsubscribe;
   }, [currentJobId, techAccepted]);
 
+  // 1b-ii. Polling สำรอง เผื่อ event Realtime ของ 'completed' หลุดหายไประหว่างทาง (เน็ตสะดุด,
+  // แอปถูกส่งไปพื้นหลังแล้วกลับมา, ฯลฯ) — เดิมพึ่ง subscribeJob() อย่างเดียว ถ้า event สุดท้าย
+  // (ช่างกดจบงาน) ไม่มาถึงจริงๆ หน้าจอลูกค้าจะค้างอยู่ที่แผนที่ตลอดไป ทั้งที่งานจบไปแล้วจริงและ
+  // ควรเด้งไปหน้าให้คะแนน/รีวิวแทน จึง poll ทุก 5 วินาทีเพื่อดึงสถานะจริงจาก DB มา sync ซ้ำ
+  // เป็นตาข่ายนิรภัยเสริมจาก Realtime ไม่ได้แทนที่ — หยุด poll เองทันทีที่งานถึงสถานะจบสิ้นแล้ว
+  useEffect(() => {
+    if (!currentJobId || trackingPhase === 'completed') return;
+    const intervalId = setInterval(() => {
+      getJob(currentJobId)
+        .then((job) => {
+          if (job) applyJobStatus(job, { silent: false });
+        })
+        .catch((err) => {
+          console.error('Error polling job status:', err);
+        });
+    }, 5000);
+    return () => clearInterval(intervalId);
+  }, [currentJobId, trackingPhase]);
+
   // 1b. ดักฟังสถานะสดของช่าง (online / working / break / offline) + พิกัด GPS จริง จากตาราง technicians
   // เพื่อให้แดชบอร์ดและแผนที่ฝั่งลูกค้าอัปเดตตามข้อมูลจริงของช่างที่ได้รับมอบหมาย
   useEffect(() => {
     if (!assignedTech.id) return;
 
     const fetchTechStatus = async () => {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('technicians')
         .select('status, current_lat, current_lng')
         .eq('id', assignedTech.id)
         .single();
+      if (error) {
+        console.error('Error fetching technician status:', error);
+      }
       if (data?.status) {
         setAssignedTech((prev) => ({ ...prev, status: data.status }));
       }
@@ -1914,6 +2878,21 @@ const handleConfirmTowingBooking = async () => {
       supabase.removeChannel(techStatusChannel);
     };
   }, [assignedTech.id]);
+
+  // 1c. คำนวณ ETA จริงจากตำแหน่ง GPS สดของช่าง -> จุดเกิดเหตุ ทุกครั้งที่พิกัดช่างขยับ
+  // (เดิมค่านี้ค้างอยู่ที่ etaTotalMinutes ตัวเดียวตลอด เพราะ getEtaMinutesRemaining() อิงจาก
+  // truckProgress ซึ่งไม่มีจุดไหนอัปเดตให้เลย — ตอนนี้ผูกกับตำแหน่งจริงผ่าน compute-route
+  // (OSRM) แทน ถ้าช่างอยู่จุดเดียวกับจุดเกิดเหตุ ตัวเลขจะเหลือใกล้ 0 นาทีจริง ไม่ใช่ค้างที่ 15)
+  useEffect(() => {
+    if (trackingPhase !== 'moving_to_red' || !techLiveCoords || !liveCoords) return;
+    let cancelled = false;
+    computeRoute(techLiveCoords, liveCoords).then((route) => {
+      if (!cancelled && route) setEtaTotalMinutes(Math.max(0, Math.round(route.durationMinutes)));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [techLiveCoords, trackingPhase, liveCoords]);
 
   // 2. ดักฟังข้อความแชตใหม่แบบ Realtime
   useEffect(() => {
@@ -2018,22 +2997,54 @@ const handleConfirmTowingBooking = async () => {
 
   const currentLangObj = languageList.find((item) => item.code === lang);
 
+  // หมายเหตุ: id ยังคงเป็นคีย์ภาษาไทยตายตัวโดยตั้งใจ (ใช้จับคู่กับ ISSUE_SERVICE_CONFIG และ
+  // ถูกส่งเป็น issueType ไปที่ backend ตรงๆ) — แปลแค่ label ที่แสดงผลให้ตรงภาษาที่เลือก (lang)
   const issueTypes = [
-    { id: 'รถเสีย', label: 'รถเสีย', icon: Car },
-    { id: 'แบตหมด', label: 'แบตหมด', icon: ActivityIcon },
-    { id: 'ยางแตก', label: 'ยางแตก', icon: Wrench },
-    { id: 'อื่นๆ', label: 'อื่นๆ', icon: AlertTriangle },
+    { id: 'รถเสีย', label: t.issueBreakdown, icon: Car },
+    { id: 'แบตหมด', label: t.issueBattery, icon: ActivityIcon },
+    { id: 'ยางแตก', label: t.issueTire, icon: Wrench },
+    { id: 'น้ำมันหมด', label: t.issueFuel, icon: Fuel },
+    { id: 'อื่นๆ', label: t.issueOther, icon: AlertTriangle },
   ];
 
   // อาการไหนไม่ต้องใช้รถลาก/สไลด์ (ราคาถูกกว่า และต้องแมทช์ช่างเฉพาะทาง แทนช่างรถลาก)
   // requiresTow: true ใช้ตัวเลือกรถสไลด์/รถยกแบบเดิม, false ใช้ specialty + basePrice ด้านล่างแทน
   const ISSUE_SERVICE_CONFIG: Record<string, { requiresTow: boolean; specialty?: string; label?: string; basePrice?: number }> = {
     'รถเสีย': { requiresTow: true },
-    'แบตหมด': { requiresTow: false, specialty: 'jump_start', label: 'บริการพ่วงแบตเตอรี่', basePrice: 400 },
-    'ยางแตก': { requiresTow: false, specialty: 'tire_change', label: 'บริการเปลี่ยน/ปะยาง', basePrice: 350 },
+    'แบตหมด': { requiresTow: false, specialty: 'jump_start', label: t.jumpStartService, basePrice: 400 },
+    'ยางแตก': { requiresTow: false, specialty: 'tire_change', label: t.tireChangeService, basePrice: 350 },
+    // ราคาตั้งเท่ากับ jump_start ไว้ก่อน (ทั้งคู่คือ "ช่างขับรถมาช่วยที่จุดเกิดเหตุ ไม่ต้องลาก")
+    // ปรับตัวเลขนี้ได้ตามต้นทุนน้ำมัน/ระยะทางจริงภายหลัง ไม่กระทบโครงสร้างโค้ด
+    'น้ำมันหมด': { requiresTow: false, specialty: 'fuel_delivery', label: t.fuelDeliveryService, basePrice: 400 },
     'อื่นๆ': { requiresTow: true },
   };
   const currentIssueConfig = ISSUE_SERVICE_CONFIG[towingRequest.selectedIssue] ?? { requiresTow: true };
+
+  // เพิ่ม: preview "มีช่างว่างใกล้จุดคุณกี่คน ใกล้สุดกี่กม." โชว์ก่อนกดยืนยันเรียกช่าง — เดิม
+  // ลูกค้ากดยืนยันแล้วรอเงียบๆ ไม่รู้เลยว่ามีช่างแถวนั้นจริงไหม (ดู 0012_nearest_tech_offer_
+  // dispatch.sql ฝั่ง backend ที่ทำให้ระบบเสนองานให้ช่างใกล้สุดจริงๆ ด้วย) ยิงใหม่ทุกครั้งที่
+  // ตำแหน่ง GPS หรือประเภทปัญหาที่เลือกเปลี่ยน ไม่ต้องรอกดยืนยันก่อนถึงจะรู้
+  const [nearbyPreview, setNearbyPreview] = useState<NearbyTechPreview | null>(null);
+  const [nearbyPreviewLoading, setNearbyPreviewLoading] = useState(false);
+  const requiredSpecialtyForPreview = currentIssueConfig.requiresTow ? 'tow' : (currentIssueConfig.specialty ?? 'tow');
+  useEffect(() => {
+    if (!liveCoords) {
+      setNearbyPreview(null);
+      return;
+    }
+    let cancelled = false;
+    setNearbyPreviewLoading(true);
+    getNearbyTechPreview(liveCoords, requiredSpecialtyForPreview)
+      .then((preview) => {
+        if (!cancelled) setNearbyPreview(preview);
+      })
+      .finally(() => {
+        if (!cancelled) setNearbyPreviewLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [liveCoords?.lat, liveCoords?.lng, requiredSpecialtyForPreview]);
 
   // ขอบเขตแผนที่ (bbox) เดิมที่คำนวณเองเทียบ % สำหรับ overlay หมุดบน iframe static ถูกลบออก
   // ทั้งหมดแล้ว — ย้ายไปให้ Leaflet (components/LiveTrackingMap.tsx) จัดการ pan/zoom/fit bounds
@@ -2042,14 +3053,52 @@ const handleConfirmTowingBooking = async () => {
   // ว่า "กำลังรอสัญญาณ GPS จากช่าง..." แทนที่จะแกล้งขยับหมุดตามเวลา ให้ตรงกับที่ขอ "แผนที่ GPS
   // ต้องเป็นของจริงแบบ real-time" มากขึ้น
 
-  // เวลาที่เหลือ (นาที) ก่อนช่างจะถึงจุดเกิดเหตุ ลดลงเรื่อยๆ ตามความคืบหน้าของหมุดช่างที่วิ่งเข้าหาหมุดแดง
+  // เวลาที่เหลือ (นาที) ก่อนช่างจะถึงจุดเกิดเหตุ — เดิมคำนวณจาก truckProgress ซึ่งเป็นตัวเลข
+  // จำลองที่ไม่มีจุดไหนอัปเดตจริง (ค้างที่ 0 เสมอ) ทำให้ ETA โชว์ค่าตั้งต้นตลอดไม่ว่าช่างจะ
+  // อยู่ตรงไหน — ตอนนี้ etaTotalMinutes ถูกอัปเดตสดจาก compute-route ทุกครั้งที่ตำแหน่ง GPS
+  // จริงของช่าง (techLiveCoords) ขยับแล้ว (ดู useEffect "1c." ด้านบน) จึงคืนค่าตรงๆ ได้เลย
   const getEtaMinutesRemaining = () => {
     if (trackingPhase === 'moving_to_red') {
-      const factor = Math.max(0, Math.min(1, (truckProgress - 15) / 35));
-      return Math.max(0, Math.ceil(etaTotalMinutes * (1 - factor)));
+      return Math.max(0, etaTotalMinutes);
     }
     return 0; // ช่างถึงจุดเกิดเหตุแล้ว (กำลังยกรถ/นำส่งอู่)
   };
+
+  // ป้ายสถานะช่างบนการ์ด "MECHANIC INFO & CONTACT" — เดิมอิงจาก assignedTech.status
+  // ('online'/'working'/'break'/'offline') ที่ดึงมาจากตาราง technicians ตรงๆ ซึ่งเป็นสถานะ
+  // "รับงานได้ทั่วไป" ของช่าง ไม่ใช่ความคืบหน้าของงานลูกค้าคนนี้จริงๆ — และเนื่องจากฝั่งช่าง
+  // (t3.txt) บังคับไม่ให้เปลี่ยนสถานะเป็น break/offline ได้เลยตราบใดที่มีงานค้างอยู่ (ดู
+  // changeStatus() ที่เช็ค activeJob) สถานะนี้จึงค้างเป็น 'working' ตลอดทั้งงานอยู่แล้ว ทำให้
+  // ป้ายค้างที่ "ช่างกำลังทำงาน" ตัวเดียวไม่ขยับเลยตั้งแต่รับงานจนจบงาน ไม่ตรงกับความคืบหน้าจริง
+  // ที่กำลังเกิดขึ้น (กำลังเดินทางมา/ถึงแล้ว/กำลังยกรถ/กำลังนำส่งอู่) ซึ่งมีอยู่แล้วใน trackingPhase
+  // (ใช้ตัวเดียวกับ statusLabel ของ LiveTrackingMap ด้านล่าง เพื่อให้ 2 จุดนี้บอกตรงกันเสมอ)
+  // เปลี่ยนมาให้ป้ายนี้สะท้อน trackingPhase แทน ส่วน break/offline ยังคงเก็บไว้เป็นข้อมูลสำรอง
+  // เผื่อกรณีขอบ (เช่น ช่างหลุดออฟไลน์กะทันหันระหว่างงานจริงๆ)
+  const techStatusDisplay = (() => {
+    // 'break'/'offline' คือสถานะจริงของช่างจากตาราง technicians (ไม่ใช่ความคืบหน้างาน) —
+    // โชว์ก่อนเป็นอันดับแรกเสมอ เพราะสำคัญกว่า trackingPhase (ลูกค้าควรรู้ทันทีถ้าช่างพัก/หลุด
+    // ออฟไลน์ระหว่างงาน แม้ trackingPhase จะยังค้างอยู่ที่เฟสเดิมก็ตาม)
+    if (assignedTech.status === 'break') {
+      return { label: t.techOnBreak, dotClass: 'bg-amber-400' };
+    }
+    if (assignedTech.status === 'offline') {
+      return { label: t.techOffline, dotClass: 'bg-slate-400' };
+    }
+    switch (trackingPhase) {
+      case 'moving_to_red':
+        return { label: t.techEnRoute, dotClass: 'bg-emerald-500' };
+      case 'loading':
+        return { label: t.techLoading, dotClass: 'bg-emerald-500' };
+      case 'on_site':
+        return { label: t.techOnSite, dotClass: 'bg-emerald-500' };
+      case 'moving_to_green':
+        return { label: t.techToGarage, dotClass: 'bg-emerald-500' };
+      case 'completed':
+        return { label: t.techCompleted, dotClass: 'bg-slate-400' };
+      default:
+        return { label: t.techWorking, dotClass: 'bg-emerald-500' };
+    }
+  })();
 
   return (
     <div className="flex min-h-screen w-full items-stretch justify-center bg-slate-900 font-sans antialiased">
@@ -2423,7 +3472,7 @@ const handleConfirmTowingBooking = async () => {
                       disabled={authSubmitting}
                       className="w-full rounded-full bg-cyan-500 py-3 text-xs font-bold text-white shadow-md active:scale-95 transition-transform mt-1 disabled:opacity-60 disabled:active:scale-100"
                     >
-                      {authSubmitting ? 'กำลังเข้าสู่ระบบ...' : t.signIn}
+                      {authSubmitting ? t.signingInEllipsis : t.signIn}
                     </button>
 
                     <div className="text-center pt-1">
@@ -2462,14 +3511,15 @@ const handleConfirmTowingBooking = async () => {
                       <button 
                         type="button" 
                         onClick={handleLineSelect}
-                        className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-2 text-xs font-semibold text-slate-700 shadow-xs hover:bg-slate-50 active:scale-95 transition-all"
+                        disabled={isLineAuthLoading}
+                        className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-2 text-xs font-semibold text-slate-700 shadow-xs hover:bg-slate-50 active:scale-95 transition-all disabled:opacity-60 disabled:active:scale-100"
                       >
                         <div className="flex h-4 w-4 items-center justify-center rounded-full bg-[#06C755] text-white">
                           <svg className="h-2.5 w-2.5" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M12 2C6.48 2 2 5.87 2 10.5c0 4.02 3.36 7.4 7.93 8.16-.11.5-.68 2.28-.78 2.63 0 0-.02.13.06.18.08.05.17.02.17.02.23-.03 2.65-1.75 3.73-2.47.62.09 1.26.14 1.89.14 5.52 0 10-3.87 10-8.66S17.52 2 12 2z" />
                           </svg>
                         </div>
-                        <span>{t.signUpLine}</span>
+                        <span>{isLineAuthLoading ? t.openingLinePageEllipsis : t.signUpLine}</span>
                       </button>
                     </div>
                   </form>
@@ -2615,7 +3665,7 @@ const handleConfirmTowingBooking = async () => {
                       disabled={authSubmitting}
                       className="w-full rounded-full bg-cyan-500 py-2.5 text-xs font-bold text-white shadow-md active:scale-95 transition-all mt-2 disabled:opacity-60 disabled:active:scale-100"
                     >
-                      {authSubmitting ? 'กำลังสมัครสมาชิก...' : t.next}
+                      {authSubmitting ? t.signingUpEllipsis : t.next}
                     </button>
                   </div>
                 )}
@@ -2778,7 +3828,7 @@ const handleConfirmTowingBooking = async () => {
                           setNewPasswordVal(e.target.value);
                           if (e.target.value.trim() !== '') setNewPasswordErr('');
                         }}
-                        placeholder="กรอกรหัสผ่านใหม่"
+                        placeholder={t.newPasswordPlaceholder}
                         className={`w-full rounded-2xl px-4 py-3 text-xs text-slate-800 focus:outline-none transition-all pr-10 shadow-inner ${
                           newPasswordErr
                             ? 'border-2 border-red-500 bg-red-50 ring-2 ring-red-100'
@@ -2810,7 +3860,7 @@ const handleConfirmTowingBooking = async () => {
                           setConfirmPasswordVal(e.target.value);
                           if (e.target.value.trim() !== '') setConfirmPasswordErr('');
                         }}
-                        placeholder="กรอกรหัสผ่านใหม่อีกครั้ง"
+                        placeholder={t.confirmNewPasswordPlaceholder}
                         className={`w-full rounded-2xl px-4 py-3 text-xs text-slate-800 focus:outline-none transition-all pr-10 shadow-inner ${
                           confirmPasswordErr
                             ? 'border-2 border-red-500 bg-red-50 ring-2 ring-red-100'
@@ -2893,6 +3943,15 @@ const handleConfirmTowingBooking = async () => {
                   )}
                 </button>
               </div>
+
+              {/* แถบเตือนเน็ตหลุด — โผล่เฉพาะตอน navigator.onLine เป็น false เท่านั้น ไม่กระทบ
+                  เลย์เอาต์ปกติตอนเน็ตปกติ อยู่ใต้ Top Nav Bar ให้เห็นชัดโดยไม่บังเนื้อหา */}
+              {!isOnline && (
+                <div className="flex items-center justify-center gap-1.5 bg-red-500 px-4 py-1.5 text-[10px] font-bold text-white z-30">
+                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" />
+                  {t.offlineBannerText}
+                </div>
+              )}
 
               {/* SIDEBAR NAVIGATION */}
               {showSidebar && (
@@ -3129,7 +4188,7 @@ const handleConfirmTowingBooking = async () => {
                         </div>
                         <div>
                           <span className="text-[10px] font-bold text-slate-500 block">{t.onlineTechs}</span>
-                          <span className="text-base font-black text-emerald-700">{techStats.online} คน</span>
+                          <span className="text-base font-black text-emerald-700">{formatNumber(techStats.online)} {t.techCountUnit}</span>
                         </div>
                       </div>
 
@@ -3139,7 +4198,7 @@ const handleConfirmTowingBooking = async () => {
                         </div>
                         <div>
                           <span className="text-[10px] font-bold text-slate-500 block">{t.workingTechs}</span>
-                          <span className="text-base font-black text-sky-700">{techStats.working} คน</span>
+                          <span className="text-base font-black text-sky-700">{formatNumber(techStats.working)} {t.techCountUnit}</span>
                         </div>
                       </div>
 
@@ -3149,7 +4208,7 @@ const handleConfirmTowingBooking = async () => {
                         </div>
                         <div>
                           <span className="text-[10px] font-bold text-slate-500 block">{t.breakTechs}</span>
-                          <span className="text-base font-black text-amber-700">{techStats.breakTime} คน</span>
+                          <span className="text-base font-black text-amber-700">{formatNumber(techStats.breakTime)} {t.techCountUnit}</span>
                         </div>
                       </div>
 
@@ -3159,7 +4218,7 @@ const handleConfirmTowingBooking = async () => {
                         </div>
                         <div>
                           <span className="text-[10px] font-bold text-slate-500 block">{t.offlineTechs}</span>
-                          <span className="text-base font-black text-slate-700">{techStats.offline} คน</span>
+                          <span className="text-base font-black text-slate-700">{formatNumber(techStats.offline)} {t.techCountUnit}</span>
                         </div>
                       </div>
                     </div>
@@ -3176,7 +4235,7 @@ const handleConfirmTowingBooking = async () => {
                         </div>
                         <div className="text-left">
                           <span className="text-xs font-black block tracking-wide uppercase">{t.requestHelpBtn}</span>
-                          <span className="text-[10px] text-sky-100 block font-medium">กดเพื่อเลือกประเภทบริการและส่งพิกัด</span>
+                          <span className="text-[10px] text-sky-100 block font-medium">{t.tapToChoosePlateSubtitle}</span>
                         </div>
                       </div>
                       <ChevronRight className="h-6 w-6 text-white group-hover:translate-x-1 transition-transform" />
@@ -3192,10 +4251,13 @@ const handleConfirmTowingBooking = async () => {
                   <div className="rounded-2xl bg-white p-3.5 shadow-xs border border-sky-100">
                     <h2 className="text-xs font-bold text-slate-800 mb-2.5 flex items-center gap-1.5">
                       <AlertTriangle className="h-4 w-4 text-amber-500" />
-                      <span>ระบุอาการเสีย / ปัญหาที่พบ</span>
+                      <span>{t.describeIssueTitle}</span>
                     </h2>
                     
-                    <div className="grid grid-cols-4 gap-2">
+                    {/* grid-cols-3 แทน grid-cols-4 เดิม — พอเพิ่ม "น้ำมันหมด" เป็นตัวเลือกที่ 5 แล้ว
+                        4 คอลัมน์จะเหลือแถวสุดท้าย 1 ช่องเดี่ยวๆ ดูไม่เป็นระเบียบ 3 คอลัมน์ (2 แถว: 3+2)
+                        จัดกลางสวยกว่าโดยไม่ต้องเปลี่ยนโครงสร้างปุ่มเลย */}
+                    <div className="grid grid-cols-3 gap-2">
                       {issueTypes.map((item) => {
                         const IconComponent = item.icon;
                         const isSelected = towingRequest.selectedIssue === item.id;
@@ -3229,15 +4291,15 @@ const handleConfirmTowingBooking = async () => {
                   <div className="rounded-2xl bg-white p-3.5 shadow-xs border border-sky-100">
                     <h2 className="text-xs font-bold text-slate-800 mb-2 flex items-center gap-1.5">
                       <User className="h-4 w-4 text-sky-500" />
-                      <span>ข้อมูลผู้แจ้ง</span>
+                      <span>{t.reporterInfoTitle}</span>
                     </h2>
                     <div className="grid grid-cols-2 gap-2 text-[11px] bg-slate-50 p-2.5 rounded-xl border border-slate-100">
                       <div>
-                        <span className="text-slate-400 block text-[9px]">ชื่อผู้แจ้ง:</span>
+                        <span className="text-slate-400 block text-[9px]">{t.reporterNameLabel}</span>
                         <span className="font-bold text-slate-800">{getUserDisplayName()}</span>
                       </div>
                       <div>
-                        <span className="text-slate-400 block text-[9px]">เบอร์โทรศัพท์:</span>
+                        <span className="text-slate-400 block text-[9px]">{t.reporterPhoneLabel}</span>
                         <span className="font-bold text-slate-800">{registerForm.phoneNumber}</span>
                       </div>
                     </div>
@@ -3248,21 +4310,24 @@ const handleConfirmTowingBooking = async () => {
                       <div>
                         <label className="text-xs font-bold text-slate-800 mb-1.5 block flex items-center gap-1.5">
                           <Truck className="h-4 w-4 text-sky-500" />
-                          <span>เลือกประเภทรถบริการ ({t.serviceType})</span>
+                          <span>{t.selectServiceTypePrefix} ({t.serviceType})</span>
                         </label>
                         <div className="grid grid-cols-2 gap-2">
-                          {['รถสไลด์ (Slide Tow)', 'รถยกช้อนล้อ (Lift Tow)'].map((type) => (
+                          {[
+                            { value: 'รถสไลด์ (Slide Tow)', label: t.towTypeSlide },
+                            { value: 'รถยกช้อนล้อ (Lift Tow)', label: t.towTypeLift },
+                          ].map((type) => (
                             <button
-                              key={type}
+                              key={type.value}
                               type="button"
-                              onClick={() => setTowingRequest(prev => ({ ...prev, towType: type }))}
+                              onClick={() => setTowingRequest(prev => ({ ...prev, towType: type.value }))}
                               className={`p-2.5 rounded-xl text-[11px] font-bold border transition-all ${
-                                towingRequest.towType === type
+                                towingRequest.towType === type.value
                                   ? 'bg-sky-500 text-white border-sky-500 shadow-xs'
                                   : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
                               }`}
                             >
-                              {type}
+                              {type.label}
                             </button>
                           ))}
                         </div>
@@ -3271,12 +4336,12 @@ const handleConfirmTowingBooking = async () => {
                       <div>
                         <label className="text-xs font-bold text-slate-800 mb-1.5 block flex items-center gap-1.5">
                           <Wrench className="h-4 w-4 text-sky-500" />
-                          <span>บริการที่จะได้รับ</span>
+                          <span>{t.serviceReceiveTitle}</span>
                         </label>
                         {/* อาการนี้ไม่ต้องใช้รถลาก/สไลด์ — ส่งช่างเฉพาะทางไปแทน (ราคาถูกกว่า) */}
                         <div className="rounded-xl bg-sky-50 border border-sky-200 px-3 py-2.5 flex items-center justify-between">
                           <span className="text-[11px] font-bold text-sky-700">{currentIssueConfig.label}</span>
-                          <span className="text-[10px] font-bold text-slate-500">ไม่ต้องใช้รถลาก</span>
+                          <span className="text-[10px] font-bold text-slate-500">{t.noTowNeededTag}</span>
                         </div>
                       </div>
                     )}
@@ -3284,17 +4349,17 @@ const handleConfirmTowingBooking = async () => {
                     <div>
                       <label className="text-xs font-bold text-slate-800 mb-1.5 block flex items-center gap-1.5">
                         <Car className="h-4 w-4 text-sky-500" />
-                        <span>ประเภทรถของท่าน ({t.vehicleCategory})</span>
+                        <span>{t.yourVehicleTypePrefix} ({t.vehicleCategory})</span>
                       </label>
                       <select
                         value={towingRequest.carCategory}
                         onChange={(e) => setTowingRequest(prev => ({ ...prev, carCategory: e.target.value }))}
                         className="w-full rounded-xl bg-slate-50 border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:border-sky-500"
                       >
-                        <option value="รถเก๋ง / Sedan">รถเก๋ง (Sedan / Hatchback)</option>
-                        <option value="รถไฟฟ้า (EV)">รถไฟฟ้า (EV / Hybrid)</option>
-                        <option value="รถกระบะ / Pickup">รถกระบะ (Pickup Truck)</option>
-                        <option value="รถ SUV / Van">รถ SUV / รถตู้ (Van)</option>
+                        <option value="รถเก๋ง / Sedan">{t.carCategorySedanOption}</option>
+                        <option value="รถไฟฟ้า (EV)">{t.carCategoryEvOption}</option>
+                        <option value="รถกระบะ / Pickup">{t.carCategoryPickupOption}</option>
+                        <option value="รถ SUV / Van">{t.carCategorySuvOption}</option>
                       </select>
                     </div>
                   </div>
@@ -3320,7 +4385,7 @@ const handleConfirmTowingBooking = async () => {
                               disabled={isFetchingLocation}
                               className="shrink-0 text-[10px] font-bold text-sky-600 underline disabled:opacity-50"
                             >
-                              {isFetchingLocation ? '...' : 'อัปเดต'}
+                              {isFetchingLocation ? '...' : t.updateBtn}
                             </button>
                           </div>
                         ) : (
@@ -3330,7 +4395,7 @@ const handleConfirmTowingBooking = async () => {
                             disabled={isFetchingLocation}
                             className="w-full text-left text-sky-600 font-bold disabled:opacity-60"
                           >
-                            {isFetchingLocation ? t.emergencySearching : 'ยังไม่พบตำแหน่งของคุณ — แตะเพื่อลองอีกครั้ง'}
+                            {isFetchingLocation ? t.emergencySearching : t.locationNotFoundTap}
                           </button>
                         )}
                         {locationError && !liveCoords && (
@@ -3341,7 +4406,7 @@ const handleConfirmTowingBooking = async () => {
                               onClick={handleUseApproximateLocation}
                               className="shrink-0 text-[10px] font-bold text-amber-600 underline"
                             >
-                              ใช้ตำแหน่งโดยประมาณแทน
+                              {t.useApproxLocationInstead}
                             </button>
                           </div>
                         )}
@@ -3355,7 +4420,7 @@ const handleConfirmTowingBooking = async () => {
                           <span>{t.nearestGarage}</span>
                         </span>
                         <div className="p-2 bg-slate-50 rounded-xl border border-slate-200 text-[11px] text-slate-700 font-medium">
-                          {towingRequest.nearestGarage || 'รอตำแหน่ง GPS จุดเกิดเหตุเพื่อค้นหาอู่ใกล้เคียง'}
+                          {towingRequest.nearestGarage || t.waitingGarageSearch}
                         </div>
                       </div>
                     ) : (
@@ -3363,9 +4428,34 @@ const handleConfirmTowingBooking = async () => {
                       // ไม่ต้องนำรถไปอู่ปลายทาง จึงไม่แสดงขั้นตอนหาอู่ใกล้เคียงให้สับสน
                       <div className="p-2.5 bg-emerald-50 rounded-xl border border-emerald-100 text-[11px] text-emerald-700 font-semibold flex items-center gap-1.5">
                         <Wrench className="h-3.5 w-3.5 shrink-0" />
-                        <span>{currentIssueConfig.label || 'ช่างซ่อมให้เสร็จที่หน้างานเลย ไม่ต้องนำรถไปอู่'}</span>
+                        <span>{currentIssueConfig.label || t.noTowRepairNote}</span>
                       </div>
                     )}
+
+                    {/* เพิ่ม: การ์ด preview ช่างว่างใกล้เคียง — ให้ลูกค้าอุ่นใจก่อนกดยืนยันว่ามี
+                        ช่างจริงแถวนั้นไหม ไม่ใช่กดแล้วรอลุ้นเงียบๆ (ดู getNearbyTechPreview) */}
+                    <div
+                      className={`p-2.5 rounded-xl border text-[11px] font-semibold flex items-center gap-1.5 ${
+                        nearbyPreviewLoading
+                          ? 'bg-slate-50 border-slate-200 text-slate-500'
+                          : nearbyPreview && nearbyPreview.nearbyCount > 0
+                          ? 'bg-emerald-50 border-emerald-100 text-emerald-700'
+                          : 'bg-amber-50 border-amber-100 text-amber-700'
+                      }`}
+                    >
+                      <MapPin className="h-3.5 w-3.5 shrink-0" />
+                      {nearbyPreviewLoading ? (
+                        <span>{t.searchingNearbyTechs}</span>
+                      ) : nearbyPreview && nearbyPreview.nearbyCount > 0 ? (
+                        <span>
+                          {t.nearbyTechsFound
+                            .replace('{count}', String(nearbyPreview.nearbyCount))
+                            .replace('{distance}', formatNumber(nearbyPreview.nearestDistanceKm ?? 0))}
+                        </span>
+                      ) : (
+                        <span>{t.noNearbyTechsFallback}</span>
+                      )}
+                    </div>
                   </div>
 
                   {/* ส่วนเลือกวิธีชำระเงิน — ใช้ selectedPaymentMethod ตัวเดียวกับแท็บ "วิธีการชำระเงิน"
@@ -3374,7 +4464,7 @@ const handleConfirmTowingBooking = async () => {
                   <div className="rounded-2xl bg-white p-3.5 shadow-xs border border-sky-100 space-y-3">
                     <h2 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
                       <CreditCard className="h-4 w-4 text-sky-500" />
-                      <span>เลือกวิธีชำระเงิน</span>
+                      <span>{t.choosePaymentChannel}</span>
                     </h2>
 
                     <div className="grid grid-cols-3 gap-2">
@@ -3405,7 +4495,7 @@ const handleConfirmTowingBooking = async () => {
                         <div className="h-8 w-8 rounded-lg bg-amber-500 text-white flex items-center justify-center">
                           <CreditCard className="h-4 w-4" />
                         </div>
-                        <span className="text-[9px] font-bold text-slate-700 text-center leading-tight">บัตรเครดิต /<br />เดบิต</span>
+                        <span className="text-[9px] font-bold text-slate-700 text-center leading-tight">{t.creditCardShort}<br />{t.debitCardShort}</span>
                       </button>
 
                       <button
@@ -3420,81 +4510,20 @@ const handleConfirmTowingBooking = async () => {
                         <div className="h-8 w-8 rounded-lg bg-emerald-600 text-white flex items-center justify-center">
                           <DollarSign className="h-4 w-4" />
                         </div>
-                        <span className="text-[9px] font-bold text-slate-700 text-center leading-tight">เงินสด</span>
+                        <span className="text-[9px] font-bold text-slate-700 text-center leading-tight">{t.cashShort}</span>
                       </button>
                     </div>
 
+                    {/* ตัดการโชว์ QR บริษัท + ช่องแนบสลิปออกจากหน้ายืนยันการจองแล้วตามที่ตกลงกันไว้ —
+                        ลูกค้าเรียกช่างได้ทันทีโดยไม่ต้องจ่ายก่อน QR + ช่องแนบสลิปจริงย้ายไปแสดงใน
+                        หน้าติดตามงานแทน (activeTab === 'activity') และจะโผล่ก็ต่อเมื่อช่างกดรับงาน
+                        แล้วเท่านั้น ตรงนี้เหลือแค่ข้อความแจ้งลูกค้าไว้เฉยๆ ว่าจะไปแนบสลิปได้ที่ไหน */}
                     {selectedPaymentMethod === 'promptpay' && (
-                      <div className="space-y-3 pt-1 animate-in fade-in duration-200">
-                        {/* QR โอนเงิน — ค่าเริ่มต้นคือ QR ของบริษัท ลูกค้าสแกนจ่ายแล้วแนบสลิปด้านล่าง */}
-                        <div className="flex flex-col items-center gap-1.5 rounded-xl border border-dashed border-sky-200 bg-sky-50/50 p-3">
-                          <div className="relative h-36 w-36 rounded-lg overflow-hidden bg-white border border-slate-200">
-                            <Image
-                              src="QR.png"
-                              alt="QR Code PromptPay บริษัท"
-                              fill
-                              sizes="144px"
-                              className="object-contain p-1.5"
-                            />
-                          </div>
-                          <p className="text-[10px] font-bold text-slate-600">QR PromptPay บริษัท DTC Service</p>
-                          <p className="text-[9px] text-slate-400 text-center leading-tight">
-                            สแกนจ่ายผ่าน QR ด้านบน แล้วแนบสลิปการโอนเงินด้านล่างเพื่อยืนยัน
-                          </p>
-                        </div>
-
-                        <input
-                          type="file"
-                          accept="image/*"
-                          ref={slipFileInputRef}
-                          onChange={handleSlipUpload}
-                          className="hidden"
-                        />
-
-                        {!slipImage ? (
-                          <button
-                            type="button"
-                            onClick={() => slipFileInputRef.current?.click()}
-                            className="w-full flex flex-col items-center justify-center p-4 border-2 border-dashed border-slate-300 rounded-xl bg-slate-50 hover:bg-slate-100 transition-colors"
-                          >
-                            <Upload className="h-6 w-6 text-slate-400 mb-1" />
-                            <span className="text-xs font-semibold text-slate-600">{t.uploadSlip}</span>
-                            <span className="text-[9px] text-slate-400 mt-0.5">รองรับไฟล์ JPG, PNG</span>
-                          </button>
-                        ) : (
-                          <div className="relative rounded-xl overflow-hidden border border-slate-200 bg-slate-900 p-2">
-                            <div className="relative h-40 w-full rounded-lg overflow-hidden">
-                              <Image
-                                src={slipImage}
-                                alt="Payment Slip Preview"
-                                fill
-                                sizes="100vw"
-                                className="object-contain"
-                              />
-                            </div>
-
-                            {/* ปุ่มเปิดดูรูปใหญ่ & ปุ่มลบสลิป */}
-                            <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-800">
-                              <button
-                                type="button"
-                                onClick={() => setExpandedBannerUrl(slipImage)}
-                                className="flex items-center gap-1 text-[10px] font-bold text-slate-300 bg-slate-800 px-2.5 py-1 rounded-lg hover:bg-slate-700 transition-colors"
-                              >
-                                <Maximize2 className="h-3 w-3" />
-                                <span>ดูรูปขยาย</span>
-                              </button>
-
-                              <button
-                                type="button"
-                                onClick={handleRemoveSlip}
-                                className="flex items-center gap-1 text-[10px] font-bold text-red-400 bg-red-950/60 border border-red-800/60 px-2.5 py-1 rounded-lg hover:bg-red-900/80 transition-colors"
-                              >
-                                <Trash2 className="h-3 w-3" />
-                                <span>{t.removeSlip}</span>
-                              </button>
-                            </div>
-                          </div>
-                        )}
+                      <div className="flex items-center gap-2.5 rounded-xl border border-sky-200 bg-sky-50/60 p-3 animate-in fade-in duration-200">
+                        <QrCode className="h-4 w-4 text-sky-600 shrink-0" />
+                        <p className="text-[10px] text-sky-800 leading-tight">
+                          {t.promptpayAfterAcceptNote}
+                        </p>
                       </div>
                     )}
 
@@ -3502,7 +4531,7 @@ const handleConfirmTowingBooking = async () => {
                       <div className="flex items-center gap-2.5 rounded-xl border border-amber-200 bg-amber-50/60 p-3 animate-in fade-in duration-200">
                         <CreditCard className="h-4 w-4 text-amber-600 shrink-0" />
                         <p className="text-[10px] text-amber-800 leading-tight">
-                          ระบบจะตัดผ่านบัตรเครดิต/เดบิตที่บันทึกไว้โดยอัตโนมัติ ไม่ต้องแนบสลิป
+                          {t.creditAutoChargeNote}
                         </p>
                       </div>
                     )}
@@ -3511,40 +4540,32 @@ const handleConfirmTowingBooking = async () => {
                       <div className="flex items-center gap-2.5 rounded-xl border border-emerald-200 bg-emerald-50/60 p-3 animate-in fade-in duration-200">
                         <DollarSign className="h-4 w-4 text-emerald-600 shrink-0" />
                         <p className="text-[10px] text-emerald-800 leading-tight">
-                          ชำระเงินสดกับช่างโดยตรงที่หน้างาน ไม่ต้องแนบสลิป
+                          {t.cashPayDirectNote}
                         </p>
                       </div>
                     )}
                   </div>
 
 
-                  <div className="rounded-2xl bg-sky-50 border border-sky-100 p-3.5 flex items-center gap-2.5">
-                    <div className="h-9 w-9 rounded-xl bg-sky-500 text-white flex items-center justify-center shadow-inner shrink-0">
-                      <Clock className="h-4.5 w-4.5" />
-                    </div>
-                    <div>
-                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">เวลาโดยประมาณที่ช่างจะถึง</p>
-                      <p className="text-sm font-black text-sky-700">
-                        {liveCoords
-                          ? `ประมาณ ${Math.max(8, Math.min(30, Math.round(towingRequest.distanceKm * 2) + 8))} นาที`
-                          : 'กรุณาตรึง GPS จุดเกิดเหตุก่อนเพื่อประเมินเวลา'}
-                      </p>
-                    </div>
-                  </div>
+                  {/* การ์ด "เวลาโดยประมาณที่ช่างจะถึง" ถูกลบออกจากหน้ายืนยันเรียกช่างแล้วตามคำขอ —
+                      เดิมเป็นการประมาณแบบหยาบจากระยะทางตรง (Haversine * 2) ก่อนที่จะมีช่างจริงมารับงาน
+                      ด้วยซ้ำ ทำให้ตัวเลขไม่แม่นและอาจตั้งความคาดหวังผิดๆ ให้ลูกค้า ตัวเลข ETA จริงที่แม่นยำ
+                      (คำนวณจาก compute-route/OSRM จากพิกัดช่างจริง) ยังคงแสดงอยู่ตามปกติในหน้าติดตามงาน
+                      (LiveTrackingMap) หลังช่างรับงานแล้ว ไม่ได้ถูกกระทบจากการลบครั้งนี้ */}
 
                   <div className="rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 p-4 text-white shadow-md border border-slate-700 space-y-2">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-1.5 text-amber-400">
                         <DollarSign className="h-4 w-4 stroke-[3]" />
-                        <span className="text-xs font-extrabold uppercase tracking-wide">ราคากลาง ETV Standard Price</span>
+                        <span className="text-xs font-extrabold uppercase tracking-wide">{t.etvPriceHeading}</span>
                       </div>
                       <ShieldCheck className="h-4 w-4 text-emerald-400" />
                     </div>
 
                     <div className="flex justify-between items-baseline pt-1 border-t border-slate-700/60">
-                      <span className="text-[11px] text-slate-300">ค่าบริการรวมสุทธิ:</span>
+                      <span className="text-[11px] text-slate-300">{t.totalServicePrice}</span>
                       <span className="text-2xl font-black text-amber-400 tracking-tight">
-                        ฿{towingRequest.calculatedEtvPrice.toLocaleString()}
+                        ฿{formatNumber(towingRequest.calculatedEtvPrice)}
                       </span>
                     </div>
 
@@ -3555,19 +4576,13 @@ const handleConfirmTowingBooking = async () => {
 
                   {!liveCoords && (
                     <p className="text-[10px] text-center text-red-500 font-semibold -mt-1">
-                      กรุณาตรึง GPS จุดเกิดเหตุด้านบนก่อน จึงจะเรียกช่างได้
-                    </p>
-                  )}
-
-                  {liveCoords && selectedPaymentMethod === 'promptpay' && !slipFile && (
-                    <p className="text-[10px] text-center text-red-500 font-semibold -mt-1">
-                      กรุณาแนบสลิปการโอนเงินในแท็บ "วิธีการชำระเงิน" ก่อน จึงจะเรียกช่างได้
+                      {t.gpsRequiredWarning}
                     </p>
                   )}
 
                   <button
                     onClick={handleConfirmTowingBooking}
-                    disabled={!liveCoords || (selectedPaymentMethod === 'promptpay' && !slipFile)}
+                    disabled={!liveCoords}
                     className="w-full rounded-2xl bg-cyan-500 py-3.5 text-xs font-bold text-white shadow-lg active:scale-95 hover:bg-cyan-600 transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:active:scale-100"
                   >
                     <Truck className="h-4 w-4" />
@@ -3588,7 +4603,7 @@ const handleConfirmTowingBooking = async () => {
 
                   {/* เลือกช่องทางหลัก */}
                   <div className="rounded-2xl bg-white p-3.5 shadow-xs border border-slate-100 space-y-2.5">
-                    <h3 className="text-xs font-bold text-slate-700 mb-2">เลือกช่องทางการชำระเงิน</h3>
+                    <h3 className="text-xs font-bold text-slate-700 mb-2">{t.choosePaymentChannel}</h3>
                     
                     {/* PromptPay */}
                     <button
@@ -3605,8 +4620,8 @@ const handleConfirmTowingBooking = async () => {
                           PP
                         </div>
                         <div className="text-left">
-                          <p className="text-xs font-bold text-slate-800">PromptPay / สแกน QR Code</p>
-                          <p className="text-[10px] text-slate-400">โอนชำระพร้อมแนบสลิปผ่านแอป</p>
+                          <p className="text-xs font-bold text-slate-800">{t.promptpayTitle}</p>
+                          <p className="text-[10px] text-slate-400">{t.promptpaySubtitle}</p>
                         </div>
                       </div>
                       <div className={`h-4 w-4 rounded-full border-2 flex items-center justify-center ${
@@ -3631,8 +4646,8 @@ const handleConfirmTowingBooking = async () => {
                           <CreditCard className="h-5 w-5" />
                         </div>
                         <div className="text-left">
-                          <p className="text-xs font-bold text-slate-800">บัตรเครดิต / เดบิต (Credit/Debit Card)</p>
-                          <p className="text-[10px] text-slate-400">ตัดผ่านบัตรที่บันทึกไว้โดยอัตโนมัติ</p>
+                          <p className="text-xs font-bold text-slate-800">{t.creditCardTitle}</p>
+                          <p className="text-[10px] text-slate-400">{t.creditCardSubtitle}</p>
                         </div>
                       </div>
                       <div className={`h-4 w-4 rounded-full border-2 flex items-center justify-center ${
@@ -3657,8 +4672,8 @@ const handleConfirmTowingBooking = async () => {
                           <DollarSign className="h-5 w-5" />
                         </div>
                         <div className="text-left">
-                          <p className="text-xs font-bold text-slate-800">เงินสด (Cash Payment)</p>
-                          <p className="text-[10px] text-slate-400">ชำระกับช่างโดยตรงที่หน้างาน</p>
+                          <p className="text-xs font-bold text-slate-800">{t.cashTitle}</p>
+                          <p className="text-[10px] text-slate-400">{t.cashSubtitle}</p>
                         </div>
                       </div>
                       <div className={`h-4 w-4 rounded-full border-2 flex items-center justify-center ${
@@ -3673,14 +4688,14 @@ const handleConfirmTowingBooking = async () => {
                   {selectedPaymentMethod === 'credit' && (
                     <div className="rounded-2xl bg-white p-3.5 shadow-xs border border-slate-100 space-y-3 animate-in fade-in duration-200">
                       <div className="flex items-center justify-between">
-                        <h3 className="text-xs font-bold text-slate-800">บัตรที่บันทึกไว้</h3>
+                        <h3 className="text-xs font-bold text-slate-800">{t.savedCardsTitle}</h3>
                         <button
                           type="button"
                           onClick={() => setShowAddCardModal(true)}
                           className="flex items-center gap-1 text-[11px] font-bold text-sky-600 hover:text-sky-700"
                         >
                           <PlusCircle className="h-3.5 w-3.5" />
-                          <span>เพิ่มบัตรใหม่</span>
+                          <span>{t.addNewCard}</span>
                         </button>
                       </div>
 
@@ -3696,7 +4711,7 @@ const handleConfirmTowingBooking = async () => {
                             </div>
                             {card.isDefault && (
                               <span className="text-[9px] font-extrabold text-sky-600 bg-sky-50 border border-sky-200 px-2 py-0.5 rounded-full">
-                                หลัก
+                                {t.primaryBadge}
                               </span>
                             )}
                           </div>
@@ -3708,9 +4723,9 @@ const handleConfirmTowingBooking = async () => {
                   <div className="rounded-2xl bg-emerald-50/80 p-3.5 border border-emerald-200 flex items-start gap-3">
                     <ShieldCheck className="h-5 w-5 text-emerald-600 shrink-0 mt-0.5" />
                     <div>
-                      <h4 className="text-xs font-bold text-emerald-800">ความปลอดภัยของระบบชำระเงิน</h4>
+                      <h4 className="text-xs font-bold text-emerald-800">{t.paymentSecurityTitle}</h4>
                       <p className="text-[10px] text-emerald-700 mt-0.5 leading-relaxed">
-                        ข้อมูลการชำระเงินทั้งหมดได้รับการเข้ารหัสความปลอดภัยระดับมาตรฐานสากล (SSL Encrypted) ปลอดภัย 100%
+                        {t.paymentSecurityDesc}
                       </p>
                     </div>
                   </div>
@@ -3727,7 +4742,7 @@ const handleConfirmTowingBooking = async () => {
                         className="flex items-center gap-1.5 text-xs font-bold text-slate-600 bg-white px-3 py-1.5 rounded-xl border border-slate-200 shadow-2xs hover:bg-slate-50 transition-colors"
                       >
                         <ArrowLeft className="h-3.5 w-3.5" />
-                        <span>ย้อนกลับหน้ารายการ</span>
+                        <span>{t.backToListBtn}</span>
                       </button>
 
                       {/* แบนเนอร์แจ้งเตือนเมื่อช่างปฏิเสธสลิป/การชำระเงิน — ให้ลูกค้ารู้ทันทีและแนบใหม่ได้เลย
@@ -3735,10 +4750,10 @@ const handleConfirmTowingBooking = async () => {
                       {myPayment?.status === 'rejected' && myPayment.payment_method === 'transfer' && (
                         <div className="rounded-2xl bg-red-50 border border-red-200 p-3.5 space-y-2.5">
                           <p className="text-xs font-bold text-red-600 flex items-center gap-1.5">
-                            <AlertCircle className="h-4 w-4" /> ช่างแจ้งว่าสลิปไม่ถูกต้อง
+                            <AlertCircle className="h-4 w-4" /> {t.slipRejectedByTech}
                           </p>
                           <p className="text-[10px] text-red-500">
-                            กรุณาตรวจสอบยอดโอนอีกครั้งแล้วแนบสลิปใหม่ด้านล่างนี้
+                            {t.reviewSlipAndReattach}
                           </p>
                           <input
                             ref={reslipFileInputRef}
@@ -3752,7 +4767,7 @@ const handleConfirmTowingBooking = async () => {
                               onClick={() => reslipFileInputRef.current?.click()}
                               className="w-full rounded-xl border-2 border-dashed border-red-300 bg-white py-3 text-[11px] font-bold text-red-500 flex items-center justify-center gap-1.5"
                             >
-                              <Upload className="h-3.5 w-3.5" /> แนบสลิปใหม่
+                              <Upload className="h-3.5 w-3.5" /> {t.reattachSlipBtn}
                             </button>
                           ) : (
                             <div className="space-y-2">
@@ -3762,7 +4777,101 @@ const handleConfirmTowingBooking = async () => {
                                 disabled={isReuploadingSlip}
                                 className="w-full rounded-xl bg-red-500 py-2.5 text-[11px] font-bold text-white disabled:opacity-50"
                               >
-                                {isReuploadingSlip ? 'กำลังส่งสลิป...' : 'ส่งสลิปใหม่'}
+                                {isReuploadingSlip ? t.sendingSlipEllipsis : t.resendSlipBtn}
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* QR โอนเงิน + ช่องแนบสลิป — ย้ายมาจากหน้า "ยืนยันการจอง" ตามที่ตกลงกันไว้:
+                          ลูกค้าเรียกช่างได้ทันทีโดยไม่ต้องจ่ายก่อน แล้วค่อยสแกน QR/แนบสลิปตรงนี้
+                          หลังช่างกดรับงานแล้วเท่านั้น (การ์ดนี้อยู่ใน showTrackingDetail ซึ่งเปิดได้
+                          ก็ต่อเมื่อ techAccepted แล้วเท่านั้น) ซ่อนอัตโนมัติทันทีที่ส่งสลิปสำเร็จ
+                          (myPayment.slip_url ไม่ใช่ null อีกต่อไป) */}
+                      {selectedPaymentMethod === 'promptpay' && !myPayment?.slip_url && (
+                        <div className="rounded-2xl bg-white p-3.5 shadow-xs border border-sky-100 space-y-3">
+                          <h2 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                            <QrCode className="h-4 w-4 text-sky-500" />
+                            <span>{t.promptpayTitle}</span>
+                          </h2>
+
+                          <div className="flex flex-col items-center gap-1.5 rounded-xl border border-dashed border-sky-200 bg-sky-50/50 p-3">
+                            <div className="relative h-36 w-36 rounded-lg overflow-hidden bg-white border border-slate-200">
+                              <Image
+                                src="QR.png"
+                                alt={t.qrCompanyAlt}
+                                fill
+                                sizes="144px"
+                                className="object-contain p-1.5"
+                              />
+                            </div>
+                            <p className="text-[10px] font-bold text-slate-600">{t.qrCompanyCaption}</p>
+                            <p className="text-[9px] text-slate-400 text-center leading-tight">
+                              {t.qrScanInstructions}
+                            </p>
+                          </div>
+
+                          <input
+                            type="file"
+                            accept="image/*"
+                            ref={slipFileInputRef}
+                            onChange={handleSlipUpload}
+                            className="hidden"
+                          />
+
+                          {!slipImage ? (
+                            <button
+                              type="button"
+                              onClick={() => slipFileInputRef.current?.click()}
+                              className="w-full flex flex-col items-center justify-center p-4 border-2 border-dashed border-slate-300 rounded-xl bg-slate-50 hover:bg-slate-100 transition-colors"
+                            >
+                              <Upload className="h-6 w-6 text-slate-400 mb-1" />
+                              <span className="text-xs font-semibold text-slate-600">{t.uploadSlip}</span>
+                              <span className="text-[9px] text-slate-400 mt-0.5">{t.supportedFileTypes}</span>
+                            </button>
+                          ) : (
+                            <div className="relative rounded-xl overflow-hidden border border-slate-200 bg-slate-900 p-2">
+                              <div className="relative h-40 w-full rounded-lg overflow-hidden">
+                                <Image
+                                  src={slipImage}
+                                  alt="Payment Slip Preview"
+                                  fill
+                                  sizes="100vw"
+                                  className="object-contain"
+                                />
+                              </div>
+
+                              {/* ปุ่มเปิดดูรูปใหญ่ & ปุ่มลบสลิป */}
+                              <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-800">
+                                <button
+                                  type="button"
+                                  onClick={() => setExpandedBannerUrl(slipImage)}
+                                  className="flex items-center gap-1 text-[10px] font-bold text-slate-300 bg-slate-800 px-2.5 py-1 rounded-lg hover:bg-slate-700 transition-colors"
+                                >
+                                  <Maximize2 className="h-3 w-3" />
+                                  <span>{t.viewEnlargedImage}</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={handleRemoveSlip}
+                                  className="flex items-center gap-1 text-[10px] font-bold text-red-400 bg-red-950/60 border border-red-800/60 px-2.5 py-1 rounded-lg hover:bg-red-900/80 transition-colors"
+                                >
+                                  <Trash2 className="h-3 w-3" />
+                                  <span>{t.removeSlip}</span>
+                                </button>
+                              </div>
+
+                              {/* ปุ่มยืนยันส่งสลิป — ต่างจากหน้าเดิมตรงที่งานถูกสร้างไปแล้ว
+                                  (currentJobId มีอยู่แล้ว) ต้องกดส่งเองแทนที่จะแนบไปพร้อมตอนจองงาน */}
+                              <button
+                                type="button"
+                                onClick={() => currentJobId && uploadPaymentSlip(currentJobId)}
+                                disabled={isUploadingSlip}
+                                className="w-full mt-2 rounded-xl bg-sky-500 py-2.5 text-[11px] font-bold text-white disabled:opacity-50"
+                              >
+                                {isUploadingSlip ? t.sendingSlipEllipsis : t.sendSlipBtn}
                               </button>
                             </div>
                           )}
@@ -3786,14 +4895,25 @@ const handleConfirmTowingBooking = async () => {
                           showGarageMarker={currentIssueConfig.requiresTow}
                           statusLabel={
                             trackingPhase === 'moving_to_red'
-                              ? 'ช่างกำลังเดินทางไปจุดเกิดเหตุ'
+                              ? t.techHeadingToScene
                               : trackingPhase === 'loading'
-                              ? 'กำลังยกรถขึ้นรถสไลด์...'
+                              ? t.techLoadingEllipsis
                               : trackingPhase === 'on_site'
-                              ? 'ช่างกำลังซ่อมให้ที่หน้างาน...'
+                              ? t.techOnSiteEllipsis
                               : currentIssueConfig.requiresTow
-                              ? 'กำลังนำรถไปส่งที่อู่จุดหมาย'
-                              : 'ซ่อมเสร็จเรียบร้อยแล้ว'
+                              ? t.techToGarageDest
+                              : t.techRepairDone
+                          }
+                          // เดิม LiveTrackingMap hardcode ป้ายหมุดช่างว่า "ช่างสไลด์" ตายตัว ทั้งที่
+                          // งานที่ไม่ต้องลากรถ (แบตหมด/ยางแตก) ช่างไม่ได้ขับรถสไลด์มาเลย — ใช้
+                          // ประเภทรถที่ลูกค้าเลือกตอนขอบริการแทน (ถ้าต้องลากรถ) หรือคำกลางๆ
+                          // ถ้าเป็นงานซ่อมหน้างานที่ไม่ต้องลาก
+                          techLabel={
+                            currentIssueConfig.requiresTow
+                              ? towingRequest.towType === 'รถยกช้อนล้อ (Lift Tow)'
+                                ? t.techLabelLift
+                                : t.techLabelSlide
+                              : t.techLabelGeneric
                           }
                         />
                       )}
@@ -3805,20 +4925,20 @@ const handleConfirmTowingBooking = async () => {
                           </div>
                           <div>
                             <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">
-                              {trackingPhase === 'moving_to_red' ? 'ถึงจุดเกิดเหตุภายใน' : 'สถานะปัจจุบัน'}
+                              {trackingPhase === 'moving_to_red' ? t.etaWithinLabel : t.currentStatusLabel}
                             </p>
                             <p className="text-sm font-black text-sky-700">
-                              {trackingPhase === 'moving_to_red' && `ประมาณ ${getEtaMinutesRemaining()} นาที`}
-                              {trackingPhase === 'loading' && 'ช่างถึงจุดเกิดเหตุแล้ว กำลังยกรถขึ้นรถสไลด์'}
-                              {trackingPhase === 'on_site' && 'ช่างถึงจุดเกิดเหตุแล้ว กำลังซ่อมให้ที่หน้างาน'}
-                              {(trackingPhase === 'moving_to_green' || (trackingPhase === 'completed' && currentIssueConfig.requiresTow)) && 'กำลังนำรถไปส่งที่อู่จุดหมาย'}
-                              {trackingPhase === 'completed' && !currentIssueConfig.requiresTow && 'ซ่อมเสร็จเรียบร้อยแล้ว'}
+                              {trackingPhase === 'moving_to_red' && t.etaApprox.replace('{min}', String(getEtaMinutesRemaining()))}
+                              {trackingPhase === 'loading' && t.arrivedLoading}
+                              {trackingPhase === 'on_site' && t.arrivedOnSite}
+                              {(trackingPhase === 'moving_to_green' || (trackingPhase === 'completed' && currentIssueConfig.requiresTow)) && t.techToGarageDest}
+                              {trackingPhase === 'completed' && !currentIssueConfig.requiresTow && t.techRepairDone}
                             </p>
                           </div>
                         </div>
                         {trackingPhase === 'moving_to_red' && (
                           <span className="text-[10px] font-bold text-slate-400 shrink-0">
-                            {towingRequest.distanceKm} กม.
+                            {formatNumber(towingRequest.distanceKm)} {t.kmUnit}
                           </span>
                         )}
                       </div>
@@ -3835,15 +4955,11 @@ const handleConfirmTowingBooking = async () => {
                                 sizes="40px"
                                 className="object-cover"
                               />
-                              {/* จุดสถานะสด: เขียว=ออนไลน์/กำลังทำงาน, เหลือง=พัก, เทา=ออฟไลน์ */}
+                              {/* จุดสถานะสด: เขียว=กำลังดำเนินงานให้คุณ, เทา=ออฟไลน์/งานจบแล้ว —
+                                  อิงจากความคืบหน้างานจริง (trackingPhase) ไม่ใช่สถานะรับงานทั่วไป
+                                  ของช่างอีกต่อไป (ดู techStatusDisplay ด้านบน) */}
                               <span
-                                className={`absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-white ${
-                                  assignedTech.status === 'break'
-                                    ? 'bg-amber-400'
-                                    : assignedTech.status === 'offline'
-                                    ? 'bg-slate-400'
-                                    : 'bg-emerald-500'
-                                }`}
+                                className={`absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-white ${techStatusDisplay.dotClass}`}
                               />
                             </div>
                             <div>
@@ -3854,7 +4970,7 @@ const handleConfirmTowingBooking = async () => {
                               <div className="flex items-center gap-1 text-[10px] text-slate-400">
                                 <Star className="h-3 w-3 fill-amber-400 text-amber-400" />
                                 <span className="font-bold text-slate-700">{assignedTech.rating}</span>
-                                <span>({assignedTech.jobs}+ งาน)</span>
+                                <span>({formatNumber(assignedTech.jobs)}+ {t.jobsUnit})</span>
                               </div>
                               <span
                                 className={`inline-block mt-0.5 text-[9px] font-bold px-1.5 py-0.5 rounded-full ${
@@ -3862,22 +4978,18 @@ const handleConfirmTowingBooking = async () => {
                                     ? 'bg-amber-50 text-amber-600'
                                     : assignedTech.status === 'offline'
                                     ? 'bg-slate-100 text-slate-500'
+                                    : trackingPhase === 'completed'
+                                    ? 'bg-slate-100 text-slate-500'
                                     : 'bg-emerald-50 text-emerald-600'
                                 }`}
                               >
-                                {assignedTech.status === 'break'
-                                  ? 'ช่างกำลังพัก'
-                                  : assignedTech.status === 'offline'
-                                  ? 'ช่างออฟไลน์'
-                                  : assignedTech.status === 'online'
-                                  ? 'ช่างออนไลน์'
-                                  : 'ช่างกำลังทำงาน'}
+                                {techStatusDisplay.label}
                               </span>
                             </div>
                           </div>
 
                           <div className="text-right">
-                            <span className="text-[9px] font-bold text-slate-400 block uppercase">ทะเบียนรถยก</span>
+                            <span className="text-[9px] font-bold text-slate-400 block uppercase">{t.towingPlateLabel}</span>
                             <span className="text-xs font-black text-sky-600 bg-sky-50 px-2 py-0.5 rounded border border-sky-100">
                               {assignedTech.plateNumber}
                             </span>
@@ -3888,7 +5000,7 @@ const handleConfirmTowingBooking = async () => {
                           <div className="flex items-center gap-2">
                             <Phone className="h-4 w-4 text-sky-600 animate-bounce" />
                             <div>
-                              <p className="text-[10px] font-bold text-slate-700">เบอร์โทรศัพท์ช่าง</p>
+                              <p className="text-[10px] font-bold text-slate-700">{t.techPhoneLabel}</p>
                               <p className="text-xs font-black text-sky-700">{assignedTech.phone}</p>
                             </div>
                           </div>
@@ -3900,7 +5012,7 @@ const handleConfirmTowingBooking = async () => {
                               className="flex items-center gap-1 bg-sky-500 text-white px-3 py-1.5 rounded-xl text-[10px] font-bold shadow-xs hover:bg-sky-600 active:scale-95 transition-all"
                             >
                               <Phone className="h-3 w-3" />
-                              <span>โทรหาช่าง</span>
+                              <span>{t.callTechBtn}</span>
                             </button>
 
                             <button
@@ -3909,7 +5021,7 @@ const handleConfirmTowingBooking = async () => {
                               className="relative flex items-center gap-1 bg-emerald-500 text-white px-2.5 py-1.5 rounded-xl text-[10px] font-bold shadow-xs hover:bg-emerald-600 active:scale-95 transition-all"
                             >
                               <MessageSquare className="h-3 w-3" />
-                              <span>แชต</span>
+                              <span>{t.chatBtn}</span>
                               {hasUnreadChat && (
                                 <span className="absolute -top-1 -right-1 flex h-2.5 w-2.5">
                                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
@@ -3925,10 +5037,10 @@ const handleConfirmTowingBooking = async () => {
                     <div className="space-y-3">
                       <div className="flex items-center justify-between">
                         <h2 className="text-xs font-extrabold text-slate-800 uppercase tracking-wide">
-                          ประวัติการเรียกใช้บริการ
+                          {t.serviceHistoryHeading}
                         </h2>
                         <span className="text-[10px] font-bold text-slate-400">
-                          ทั้งหมด {serviceHistory.length} รายการ
+                          {t.totalItemsPrefix} {formatNumber(serviceHistory.length)} {t.totalItemsSuffix}
                         </span>
                       </div>
 
@@ -3942,12 +5054,23 @@ const handleConfirmTowingBooking = async () => {
                               </div>
                             </div>
                             <div>
-                              <p className="text-xs font-bold">กำลังหาช่างที่ใกล้ที่สุดให้คุณ...</p>
+                              <p className="text-xs font-bold">{t.findingNearestTech}</p>
                               <p className="text-[10px] text-slate-300 mt-0.5">
-                                รอช่างกดรับงาน แผนที่ติดตามจะเปิดขึ้นอัตโนมัติทันทีที่มีช่างรับงาน
+                                {t.waitingTechAccept}
                               </p>
                             </div>
                           </div>
+                          {/* ปุ่มยกเลิก — โชว์เฉพาะตอนยังไม่มีช่างรับงาน (ตรงกับเงื่อนไข !techAccepted
+                              ของการ์ดนี้อยู่แล้ว) กดแล้วเรียก cancelJob() ผ่าน RPC จริง ไม่ใช่แค่ซ่อน UI
+                              เฉยๆ — เพื่อให้ระบบฝั่งช่างไม่เห็นงานนี้ค้างอยู่ในคิวอีกต่อไป */}
+                          <button
+                            type="button"
+                            onClick={handleCancelJob}
+                            disabled={isCancellingJob}
+                            className="mt-3 w-full rounded-xl border border-white/25 bg-white/10 py-2 text-[11px] font-bold text-white/90 transition-colors hover:bg-white/20 disabled:opacity-50"
+                          >
+                            {isCancellingJob ? t.cancellingEllipsis : t.cancelRequestBtn}
+                          </button>
                         </div>
                       )}
 
@@ -3958,10 +5081,10 @@ const handleConfirmTowingBooking = async () => {
                         >
                           <div className="flex items-center justify-between mb-2">
                             <span className="text-[10px] font-extrabold bg-white/20 backdrop-blur-xs px-2.5 py-0.5 rounded-full uppercase tracking-wider">
-                              กำลังดำเนินการ (Active)
+                              {t.activeStatusBadge}
                             </span>
                             <span className="text-xs font-bold text-sky-100 flex items-center gap-1">
-                              <span>ดูแผนที่ Live Tracking</span>
+                              <span>{t.viewLiveTrackingMap}</span>
                               <ChevronRight className="h-4 w-4" />
                             </span>
                           </div>
@@ -3969,10 +5092,10 @@ const handleConfirmTowingBooking = async () => {
                           <div className="flex justify-between items-end">
                             <div>
                               <p className="text-xs font-black">{towingRequest.towType}</p>
-                              <p className="text-[10px] text-sky-100">{towingRequest.carCategory} • {towingRequest.gpsLocation.split('(')[1]?.replace(')', '') || 'สุขุมวิท 21'}</p>
-                              <p className="text-[10px] text-amber-200 font-bold mt-1">ช่าง: {assignedTech.name}</p>
+                              <p className="text-[10px] text-sky-100">{towingRequest.carCategory} • {towingRequest.gpsLocation.split('(')[1]?.replace(')', '') || 'Sukhumvit 21'}</p>
+                              <p className="text-[10px] text-amber-200 font-bold mt-1">{t.mechanicLabelShort} {assignedTech.name}</p>
                             </div>
-                            <span className="text-base font-black text-amber-300">฿{towingRequest.calculatedEtvPrice.toLocaleString()}</span>
+                            <span className="text-base font-black text-amber-300">฿{formatNumber(towingRequest.calculatedEtvPrice)}</span>
                           </div>
                         </div>
                       )}
@@ -3985,27 +5108,27 @@ const handleConfirmTowingBooking = async () => {
                               <span className="text-xs font-bold text-slate-800">{item.towType}</span>
                             </div>
                             <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-100">
-                              {item.status}
+                              {item.status === 'เสร็จสิ้น' ? t.historyStatusCompleted : t.historyStatusInProgress}
                             </span>
                           </div>
 
                           <div className="grid grid-cols-2 gap-1 text-[10px] text-slate-500">
-                            <div>วันที่: <span className="font-semibold text-slate-700">{item.date} ({item.time})</span></div>
-                            <div>ประเภทรถ: <span className="font-semibold text-slate-700">{item.carCategory}</span></div>
-                            <div className="col-span-2 truncate">สถานที่: <span className="font-semibold text-slate-700">{item.location}</span></div>
-                            <div className="col-span-2">ช่างผู้ดูแล: <span className="font-semibold text-slate-700">{item.techName}</span></div>
+                            <div>{t.historyDateLabel} <span className="font-semibold text-slate-700">{item.date} ({item.time})</span></div>
+                            <div>{t.historyCarTypeLabel} <span className="font-semibold text-slate-700">{item.carCategory}</span></div>
+                            <div className="col-span-2 truncate">{t.historyLocationLabel} <span className="font-semibold text-slate-700">{item.location}</span></div>
+                            <div className="col-span-2">{t.historyTechLabel} <span className="font-semibold text-slate-700">{item.techName}</span></div>
                           </div>
 
                           <div className="flex items-center justify-between pt-1 border-t border-slate-50 text-xs">
-                            <span className="text-slate-400 text-[10px]">ยอดชำระสุทธิ</span>
-                            <span className="font-black text-slate-800">฿{item.price.toLocaleString()}</span>
+                            <span className="text-slate-400 text-[10px]">{t.netPaidLabel}</span>
+                            <span className="font-black text-slate-800">฿{formatNumber(item.price)}</span>
                           </div>
 
                           <button
                             onClick={() => handleReportServiceIssue(item.id)}
                             className="flex items-center gap-1 text-[10px] font-bold text-red-500 pt-1"
                           >
-                            <AlertCircle className="h-3 w-3" /> รายงานปัญหา
+                            <AlertCircle className="h-3 w-3" /> {t.reportIssueBtn}
                           </button>
                         </div>
                       ))}
@@ -4398,7 +5521,7 @@ const handleConfirmTowingBooking = async () => {
                         className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-amber-50 border border-amber-200 py-2.5 text-xs font-bold text-amber-700 hover:bg-amber-100 active:scale-95 transition-all"
                       >
                         <MapPin className="h-3.5 w-3.5" />
-                        <span>ใช้ตำแหน่งโดยประมาณแทน (เปิด GPS ไม่ได้)</span>
+                        <span>{t.useApproxLocationInstead}</span>
                       </button>
                     )}
                   </div>
@@ -4432,7 +5555,7 @@ const handleConfirmTowingBooking = async () => {
                   }`}
                 >
                   <Home className="h-5 w-5" />
-                  <span className="text-[9px]">หน้าแรก</span>
+                  <span className="text-[9px]">{t.navHome}</span>
                 </button>
 
                 <button
@@ -4442,7 +5565,7 @@ const handleConfirmTowingBooking = async () => {
                   }`}
                 >
                   <Wrench className="h-5 w-5" />
-                  <span className="text-[9px]">เรียกรถยก</span>
+                  <span className="text-[9px]">{t.navRequest}</span>
                 </button>
 
                 <button
@@ -4458,7 +5581,7 @@ const handleConfirmTowingBooking = async () => {
                       <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
                     </span>
                   </div>
-                  <span className="text-[9px] text-red-500 font-bold">สายด่วน</span>
+                  <span className="text-[9px] text-red-500 font-bold">{t.navHotline}</span>
                 </button>
 
                 <button
@@ -4476,7 +5599,7 @@ const handleConfirmTowingBooking = async () => {
                       </span>
                     )}
                   </div>
-                  <span className="text-[9px]">ประวัติ</span>
+                  <span className="text-[9px]">{t.navHistory}</span>
                 </button>
 
                 <button
@@ -4486,7 +5609,7 @@ const handleConfirmTowingBooking = async () => {
                   }`}
                 >
                   <User className="h-5 w-5" />
-                  <span className="text-[9px]">โปรไฟล์</span>
+                  <span className="text-[9px]">{t.navProfile}</span>
                 </button>
               </div>
 
@@ -4528,7 +5651,7 @@ const handleConfirmTowingBooking = async () => {
                 </div>
                 <div>
                   <h3 className="text-xs font-bold leading-tight">{activeChatTech.name}</h3>
-                  <span className="text-[9px] text-sky-100 block">ออนไลน์ • ทะเบียน {activeChatTech.plateNumber}</span>
+                  <span className="text-[9px] text-sky-100 block">{t.onlinePlateStatus} {activeChatTech.plateNumber}</span>
                 </div>
               </div>
               <button 
@@ -4567,10 +5690,10 @@ const handleConfirmTowingBooking = async () => {
             {myPayment?.status === 'rejected' && myPayment.payment_method === 'transfer' && (
               <div className="mx-2.5 mb-2.5 rounded-2xl bg-red-50 border border-red-200 p-3 space-y-2 shrink-0">
                 <p className="text-xs font-bold text-red-600 flex items-center gap-1.5">
-                  <AlertCircle className="h-4 w-4" /> ช่างแจ้งว่าสลิปไม่ถูกต้อง
+                  <AlertCircle className="h-4 w-4" /> {t.slipRejectedByTech}
                 </p>
                 <p className="text-[10px] text-red-500">
-                  กรุณาตรวจสอบยอดโอนอีกครั้งแล้วแนบสลิปใหม่ด้านล่างนี้
+                  {t.reviewSlipAndReattach}
                 </p>
                 <input
                   ref={reslipChatFileInputRef}
@@ -4584,7 +5707,7 @@ const handleConfirmTowingBooking = async () => {
                     onClick={() => reslipChatFileInputRef.current?.click()}
                     className="w-full rounded-xl border-2 border-dashed border-red-300 bg-white py-2.5 text-[11px] font-bold text-red-500 flex items-center justify-center gap-1.5"
                   >
-                    <Upload className="h-3.5 w-3.5" /> แนบสลิปใหม่
+                    <Upload className="h-3.5 w-3.5" /> {t.reattachSlipBtn}
                   </button>
                 ) : (
                   <div className="space-y-2">
@@ -4594,7 +5717,7 @@ const handleConfirmTowingBooking = async () => {
                       disabled={isReuploadingSlip}
                       className="w-full rounded-xl bg-red-500 py-2.5 text-[11px] font-bold text-white disabled:opacity-50"
                     >
-                      {isReuploadingSlip ? 'กำลังส่งสลิป...' : 'ส่งสลิปใหม่'}
+                      {isReuploadingSlip ? t.sendingSlipEllipsis : t.resendSlipBtn}
                     </button>
                   </div>
                 )}
@@ -4608,7 +5731,7 @@ const handleConfirmTowingBooking = async () => {
                 value={inputMsg}
                 onChange={(e) => setInputMsg(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-                placeholder="พิมพ์ข้อความ..."
+                placeholder={t.chatInputPlaceholder}
                 className="flex-1 rounded-xl bg-slate-100 px-3 py-2 text-xs text-slate-800 focus:outline-none focus:bg-white focus:ring-1 focus:ring-sky-500"
               />
               <button
@@ -4629,7 +5752,7 @@ const handleConfirmTowingBooking = async () => {
               <div className="flex items-center justify-between border-b border-slate-100 pb-2">
                 <h3 className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
                   <CreditCard className="h-4 w-4 text-sky-500" />
-                  <span>เพิ่มบัตรเครดิต / เดบิตใหม่</span>
+                  <span>{t.addNewCardTitle}</span>
                 </h3>
                 <button onClick={() => setShowAddCardModal(false)} className="text-slate-400 hover:text-slate-600">
                   <X className="h-4 w-4" />
@@ -4638,7 +5761,7 @@ const handleConfirmTowingBooking = async () => {
 
               <form onSubmit={handleAddCard} className="space-y-3">
                 <div>
-                  <label className="text-[10px] font-bold text-slate-600 mb-1 block">ชื่อบนบัตร</label>
+                  <label className="text-[10px] font-bold text-slate-600 mb-1 block">{t.nameOnCard}</label>
                   <input
                     type="text"
                     value={newCardName}
@@ -4649,7 +5772,7 @@ const handleConfirmTowingBooking = async () => {
                 </div>
 
                 <div>
-                  <label className="text-[10px] font-bold text-slate-600 mb-1 block">หมายเลขบัตร (16 หลัก)</label>
+                  <label className="text-[10px] font-bold text-slate-600 mb-1 block">{t.cardNumberLabel}</label>
                   <input
                     type="text"
                     maxLength={16}
@@ -4662,7 +5785,7 @@ const handleConfirmTowingBooking = async () => {
 
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <label className="text-[10px] font-bold text-slate-600 mb-1 block">วันหมดอายุ (MM/YY)</label>
+                    <label className="text-[10px] font-bold text-slate-600 mb-1 block">{t.expiryLabel}</label>
                     <input
                       type="text"
                       maxLength={5}
@@ -4674,7 +5797,7 @@ const handleConfirmTowingBooking = async () => {
                   </div>
 
                   <div>
-                    <label className="text-[10px] font-bold text-slate-600 mb-1 block">รหัส CVC / CVV</label>
+                    <label className="text-[10px] font-bold text-slate-600 mb-1 block">{t.cvcLabel}</label>
                     <input
                       type="password"
                       maxLength={3}
@@ -4690,7 +5813,7 @@ const handleConfirmTowingBooking = async () => {
                   type="submit"
                   className="w-full rounded-xl bg-sky-500 py-2.5 text-xs font-bold text-white shadow-md hover:bg-sky-600 active:scale-95 transition-all mt-2"
                 >
-                  บันทึกบัตรชำระเงิน
+                  {t.saveCardBtn}
                 </button>
               </form>
             </div>
@@ -4706,32 +5829,32 @@ const handleConfirmTowingBooking = async () => {
               </div>
 
               <div>
-                <h3 className="text-base font-extrabold text-slate-900">งานบริการเสร็จสิ้น!</h3>
-                <p className="text-[11px] text-slate-400 mt-1">ช่างถึงอู่ปลายทางเรียบร้อยแล้ว ให้คะแนนความพึงพอใจกันหน่อย</p>
+                <h3 className="text-base font-extrabold text-slate-900">{t.jobCompletedTitle}</h3>
+                <p className="text-[11px] text-slate-400 mt-1">{t.jobCompletedSub}</p>
               </div>
 
               {/* สรุปใบเสร็จย่อ — ราคา/วิธีชำระเงินที่ใช้จริงในงานนี้ เดิมกดจบงานแล้วไม่มีสรุปให้ดูเลย */}
               <div className="rounded-2xl bg-slate-900 text-white p-3.5 text-left space-y-1.5">
-                <p className="text-[9px] font-bold text-slate-400 uppercase tracking-wide">สรุปค่าบริการ</p>
+                <p className="text-[9px] font-bold text-slate-400 uppercase tracking-wide">{t.serviceFeeSummaryLabel}</p>
                 <div className="flex items-center justify-between">
-                  <span className="text-[11px] text-slate-300">ค่าบริการ</span>
+                  <span className="text-[11px] text-slate-300">{t.serviceFeeLabel}</span>
                   <span className="text-sm font-black text-amber-300">
-                    ฿{(towingRequest.calculatedEtvPrice ?? 0).toLocaleString()}
+                    ฿{formatNumber(towingRequest.calculatedEtvPrice ?? 0)}
                   </span>
                 </div>
                 <div className="flex items-center justify-between">
-                  <span className="text-[11px] text-slate-300">วิธีชำระเงิน</span>
+                  <span className="text-[11px] text-slate-300">{t.paymentMethodLabel}</span>
                   <span className="text-[11px] font-bold text-white">
                     {myPayment?.payment_method === 'cash'
-                      ? 'เงินสด'
+                      ? t.cashShort
                       : myPayment?.payment_method === 'credit'
-                      ? 'บัตรเครดิต/เดบิต'
-                      : 'PromptPay / โอนเงิน'}
+                      ? t.creditCardTitle
+                      : t.paymentMethodTransfer}
                   </span>
                 </div>
                 {myPayment && (
                   <div className="flex items-center justify-between">
-                    <span className="text-[11px] text-slate-300">สถานะ</span>
+                    <span className="text-[11px] text-slate-300">{t.statusLabel}</span>
                     <span
                       className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
                         myPayment.status === 'verified'
@@ -4739,7 +5862,7 @@ const handleConfirmTowingBooking = async () => {
                           : 'bg-amber-500/20 text-amber-300'
                       }`}
                     >
-                      {myPayment.status === 'verified' ? 'ช่างยืนยันรับเงินแล้ว' : 'รอช่างตรวจสอบ'}
+                      {myPayment.status === 'verified' ? t.techConfirmedPayment : t.waitingTechVerify}
                     </span>
                   </div>
                 )}
@@ -4765,14 +5888,14 @@ const handleConfirmTowingBooking = async () => {
                   ))}
                 </div>
                 <p className="text-xs font-bold text-amber-500">
-                  {['แย่มาก', 'ไม่ประทับใจ', 'พอใช้', 'ดี', 'ดีเยี่ยม!'][rating - 1]}
+                  {t.ratingLabels.split(',')[rating - 1]}
                 </p>
               </div>
 
               <textarea
                 value={reviewText}
                 onChange={(e) => setReviewText(e.target.value)}
-                placeholder="เขียนข้อเสนอแนะหรือคำชมเชยช่าง (ถ้ามี)..."
+                placeholder={t.reviewFeedbackPlaceholder}
                 className="w-full h-20 rounded-xl bg-slate-50 border border-slate-200 p-2.5 text-xs text-slate-800 focus:outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-100 resize-none transition-all"
               />
 
@@ -4781,7 +5904,7 @@ const handleConfirmTowingBooking = async () => {
                 onClick={handleSubmitReview}
                 className="w-full rounded-xl bg-gradient-to-r from-sky-500 to-sky-600 py-3 text-xs font-bold text-white shadow-md shadow-sky-200 hover:from-sky-600 hover:to-sky-700 active:scale-95 transition-all"
               >
-                ส่งรีวิวและปิดงาน
+                {t.submitReviewBtn}
               </button>
             </div>
           </div>
@@ -4796,7 +5919,7 @@ const handleConfirmTowingBooking = async () => {
               </div>
               <h3 className="text-base font-extrabold text-slate-900">{t.bookingSuccess}</h3>
               <p className="text-xs text-slate-500 leading-relaxed">
-                ระบบกำลังส่งข้อมูลไปยังช่างสไลด์ที่ใกล้คุณที่สุด...
+                {t.sendingToNearestTechLoading}
               </p>
             </div>
           </div>
@@ -4814,10 +5937,10 @@ const handleConfirmTowingBooking = async () => {
               </div>
 
               <div className="flex-1 overflow-y-auto text-[11px] text-slate-600 space-y-2 pr-1">
-                <p>1. เงื่อนไขการให้บริการยกรถและช่วยเหลือฉุกเฉิน DTC Intelligent Towing Service</p>
-                <p>2. ผู้ใช้บริการต้องให้ข้อมูลพิกัดสถานที่และรายละเอียด ยี่ห้อ/รุ่น ของยานพาหนะตามความเป็นจริง</p>
-                <p>3. อัตราค่าบริการคำนวณตามราคากลางมาตรฐาน ETV ห้ามช่างเรียกเก็บเงินเพิ่มเติมเกินอัตรากำหนด</p>
-                <p>4. การยกเลิกคำขอหลังช่างออกเดินทางแล้วอาจมีค่าธรรมเนียมตามที่กำหนดในเงื่อนไข</p>
+                <p>{t.termsLine1}</p>
+                <p>{t.termsLine2}</p>
+                <p>{t.termsLine3}</p>
+                <p>{t.termsLine4}</p>
               </div>
 
               <button
@@ -4842,9 +5965,9 @@ const handleConfirmTowingBooking = async () => {
               </div>
 
               <div className="flex-1 overflow-y-auto text-[11px] text-slate-600 space-y-2 pr-1">
-                <p>1. เราให้ความสำคัญกับความเป็นส่วนตัวและการคุ้มครองข้อมูลส่วนบุคคลของคุณ (PDPA Compliance)</p>
-                <p>2. ข้อมูล GPS และเบอร์โทรศัพท์ของคุณจะถูกใช้เพื่อการจับคู่และเดินทางไปให้ความช่วยเหลือของช่างเท่านั้น</p>
-                <p>3. ข้อมูลบัตรและประวัติการชำระเงินจะถูกจัดเก็บด้วยมาตรฐานความปลอดภัย SSL Encrypted ไม่มีการเปิดเผยแก่บุคคลภายนอก</p>
+                <p>{t.privacyLine1}</p>
+                <p>{t.privacyLine2}</p>
+                <p>{t.privacyLine3}</p>
               </div>
 
               <button
@@ -4864,7 +5987,7 @@ const handleConfirmTowingBooking = async () => {
               <div className="flex items-center justify-between border-b border-slate-100 pb-2">
                 <h3 className="text-xs font-bold text-slate-800 flex items-center gap-2">
                   <Bell className="h-4 w-4 text-sky-500" />
-                  <span>การแจ้งเตือน</span>
+                  <span>{t.notificationsTitle}</span>
                 </h3>
                 <button onClick={() => setShowNotificationsPanel(false)} className="text-slate-400 hover:text-slate-600">
                   <X className="h-4 w-4" />
@@ -4876,13 +5999,13 @@ const handleConfirmTowingBooking = async () => {
                   onClick={handleMarkAllNotificationsRead}
                   className="self-end text-[10px] font-bold text-sky-600 hover:underline"
                 >
-                  ทำเครื่องหมายว่าอ่านทั้งหมด
+                  {t.markAllReadBtn}
                 </button>
               )}
 
               <div className="flex-1 overflow-y-auto space-y-2 pr-1">
                 {notifications.length === 0 ? (
-                  <p className="text-xs text-slate-400 text-center py-6">ยังไม่มีการแจ้งเตือน</p>
+                  <p className="text-xs text-slate-400 text-center py-6">{t.noNotificationsYet}</p>
                 ) : (
                   notifications.map((n) => (
                     <button
@@ -4920,7 +6043,7 @@ const handleConfirmTowingBooking = async () => {
               <div className="flex items-center justify-between border-b border-slate-100 pb-2">
                 <h3 className="text-xs font-bold text-slate-800 flex items-center gap-2">
                   <Settings className="h-4 w-4 text-sky-500" />
-                  <span>ตั้งค่าแอปพลิเคชัน</span>
+                  <span>{t.appSettingsTitle}</span>
                 </h3>
                 <button onClick={() => setShowSettingsModal(false)} className="text-slate-400 hover:text-slate-600">
                   <X className="h-4 w-4" />
@@ -4928,10 +6051,10 @@ const handleConfirmTowingBooking = async () => {
               </div>
 
               <div className="space-y-3">
-                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">การแจ้งเตือน</p>
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">{t.notificationsSectionLabel}</p>
 
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-slate-700">เสียงแจ้งเตือน</span>
+                  <span className="text-xs font-semibold text-slate-700">{t.notificationSoundLabel}</span>
                   <button
                     onClick={() => setNotifSoundEnabled(!notifSoundEnabled)}
                     className={`relative h-6 w-11 rounded-full transition-colors ${notifSoundEnabled ? 'bg-sky-500' : 'bg-slate-200'}`}
@@ -4941,7 +6064,7 @@ const handleConfirmTowingBooking = async () => {
                 </div>
 
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-slate-700">การสั่นเตือน</span>
+                  <span className="text-xs font-semibold text-slate-700">{t.vibrationLabel}</span>
                   <button
                     onClick={() => setNotifVibrateEnabled(!notifVibrateEnabled)}
                     className={`relative h-6 w-11 rounded-full transition-colors ${notifVibrateEnabled ? 'bg-sky-500' : 'bg-slate-200'}`}
@@ -4952,9 +6075,9 @@ const handleConfirmTowingBooking = async () => {
               </div>
 
               <div className="space-y-3 pt-2 border-t border-slate-100">
-                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">การแสดงผล</p>
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">{t.displaySectionLabel}</p>
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-slate-700">โหมดมืด (Dark Mode)</span>
+                  <span className="text-xs font-semibold text-slate-700">{t.darkModeLabel}</span>
                   <button
                     onClick={() => setDarkModeEnabled(!darkModeEnabled)}
                     className={`relative h-6 w-11 rounded-full transition-colors ${darkModeEnabled ? 'bg-sky-500' : 'bg-slate-200'}`}
@@ -4969,14 +6092,14 @@ const handleConfirmTowingBooking = async () => {
                   onClick={() => { setShowSettingsModal(false); setActiveTab('profile'); }}
                   className="flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-xs font-bold text-slate-700 hover:bg-slate-50"
                 >
-                  <span className="flex items-center gap-2"><User className="h-4 w-4 text-sky-500" /> จัดการบัญชีของฉัน</span>
+                  <span className="flex items-center gap-2"><User className="h-4 w-4 text-sky-500" /> {t.manageMyAccount}</span>
                   <ChevronRight className="h-4 w-4 text-slate-300" />
                 </button>
                 <button
-                  onClick={() => { setShowSettingsModal(false); setAppToast({ message: 'คำขอลบบัญชีถูกส่งแล้ว ทีมงานจะติดต่อกลับภายใน 3 วันทำการ', type: 'success' }); }}
+                  onClick={() => { setShowSettingsModal(false); setAppToast({ message: t.deleteAccountRequestToast, type: 'success' }); }}
                   className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs font-bold text-red-500 hover:bg-red-50"
                 >
-                  <Trash2 className="h-4 w-4" /> ลบบัญชีผู้ใช้งาน
+                  <Trash2 className="h-4 w-4" /> {t.deleteAccountBtn}
                 </button>
               </div>
 
@@ -4992,7 +6115,7 @@ const handleConfirmTowingBooking = async () => {
               <div className="flex items-center justify-between border-b border-slate-100 pb-2">
                 <h3 className="text-xs font-bold text-slate-800 flex items-center gap-2">
                   <Headphones className="h-4 w-4 text-sky-500" />
-                  <span>ศูนย์ช่วยเหลือ / คำถามที่พบบ่อย</span>
+                  <span>{t.helpCenterTitle}</span>
                 </h3>
                 <button onClick={() => setShowFaqModal(false)} className="text-slate-400 hover:text-slate-600">
                   <X className="h-4 w-4" />
@@ -5005,15 +6128,15 @@ const handleConfirmTowingBooking = async () => {
                 className="flex items-center justify-center gap-2 rounded-xl bg-red-500 py-2.5 text-xs font-bold text-white shadow-md active:scale-95 transition-all"
               >
                 <PhoneCall className="h-3.5 w-3.5" />
-                <span>โทรสายด่วนฉุกเฉิน 1176</span>
+                  <span>{t.emergencyHotlineBtn}</span>
               </button>
 
               <div className="flex-1 overflow-y-auto space-y-2 pr-1">
                 {[
-                  { q: 'เรียกรถสไลด์แล้วช่างมาถึงภายในกี่นาที?', a: 'โดยเฉลี่ยช่างจะถึงจุดหมายภายใน 15-30 นาที ขึ้นอยู่กับระยะทางและสภาพการจราจร' },
-                  { q: 'ค่าบริการคำนวณอย่างไร?', a: 'ระบบคำนวณตามราคากลางมาตรฐาน ETV โดยพิจารณาจากประเภทรถบริการและระยะทาง ช่างไม่สามารถเรียกเก็บเกินราคาที่ระบบแจ้งได้' },
-                  { q: 'ยกเลิกคำขอได้หรือไม่?', a: 'ยกเลิกได้ก่อนช่างออกเดินทาง หากยกเลิกหลังช่างออกเดินทางแล้วอาจมีค่าธรรมเนียมตามเงื่อนไขการให้บริการ' },
-                  { q: 'ชำระเงินได้ช่องทางใดบ้าง?', a: 'รองรับพร้อมเพย์ (แนบสลิป), บัตรเครดิต/เดบิต และเงินสดกับช่างโดยตรง' },
+                  { q: t.faqQ1, a: t.faqA1 },
+                  { q: t.faqQ2, a: t.faqA2 },
+                  { q: t.faqQ3, a: t.faqA3 },
+                  { q: t.faqQ4, a: t.faqA4 },
                 ].map((item, idx) => (
                   <div key={idx} className="rounded-xl border border-slate-100 overflow-hidden">
                     <button
@@ -5049,7 +6172,7 @@ const handleConfirmTowingBooking = async () => {
 
               <form onSubmit={handleAddCar} className="space-y-3">
                 <div>
-                  <label className="text-[10px] font-bold text-slate-600 mb-1 block">ยี่ห้อรถ</label>
+                  <label className="text-[10px] font-bold text-slate-600 mb-1 block">{t.carBrandLabel}</label>
                   <input
                     type="text"
                     value={newCarBrand}
@@ -5059,7 +6182,7 @@ const handleConfirmTowingBooking = async () => {
                   />
                 </div>
                 <div>
-                  <label className="text-[10px] font-bold text-slate-600 mb-1 block">รุ่นรถ</label>
+                  <label className="text-[10px] font-bold text-slate-600 mb-1 block">{t.carModelLabel}</label>
                   <input
                     type="text"
                     value={newCarModel}
@@ -5069,12 +6192,12 @@ const handleConfirmTowingBooking = async () => {
                   />
                 </div>
                 <div>
-                  <label className="text-[10px] font-bold text-slate-600 mb-1 block">ทะเบียนรถ</label>
+                  <label className="text-[10px] font-bold text-slate-600 mb-1 block">{t.plateNumberLabel}</label>
                   <input
                     type="text"
                     value={newCarPlate}
                     onChange={(e) => setNewCarPlate(e.target.value)}
-                    placeholder="กข 1234 กทม."
+                    placeholder={t.platePlaceholder}
                     className="w-full rounded-xl bg-slate-50 border border-slate-200 px-3 py-2 text-xs text-slate-800 focus:outline-none focus:border-sky-500"
                   />
                 </div>
@@ -5083,7 +6206,7 @@ const handleConfirmTowingBooking = async () => {
                   type="submit"
                   className="w-full rounded-xl bg-sky-500 py-2.5 text-xs font-bold text-white shadow-md hover:bg-sky-600 active:scale-95 transition-all mt-2"
                 >
-                  บันทึกรถคันนี้
+                  {t.saveCarBtn}
                 </button>
               </form>
             </div>
@@ -5099,7 +6222,7 @@ const handleConfirmTowingBooking = async () => {
                 <Phone className="h-9 w-9 relative animate-bounce" />
               </div>
               <div>
-                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">กำลังโทรออกหาช่าง</p>
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">{t.callingTechTitle}</p>
                 <h3 className="text-base font-bold text-white mt-1">{callingTechName}</h3>
                 <p className="text-sm text-sky-300 font-black mt-0.5">{callingTechPhone}</p>
               </div>
@@ -5110,14 +6233,14 @@ const handleConfirmTowingBooking = async () => {
                 className="flex w-full items-center justify-center gap-2 rounded-xl bg-sky-500 py-3 text-xs font-bold text-white shadow-md hover:bg-sky-600 active:scale-95 transition-all"
               >
                 <PhoneCall className="h-4 w-4" />
-                <span>เปิดแอปโทรศัพท์เพื่อโทรออก</span>
+                <span>{t.openPhoneAppBtn}</span>
               </a>
 
               <button
                 onClick={() => setShowCallingModal(false)}
                 className="w-full rounded-xl bg-white/10 py-2.5 text-xs font-bold text-slate-300 hover:bg-white/20 transition-colors"
               >
-                ยกเลิก
+                {t.cancelBtn}
               </button>
             </div>
           </div>
@@ -5132,7 +6255,7 @@ const handleConfirmTowingBooking = async () => {
                 <PhoneCall className="h-9 w-9 relative animate-bounce" />
               </div>
               <div>
-                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">สายเรียกเข้าจากช่าง</p>
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">{t.incomingCallFromTech}</p>
                 <h3 className="text-base font-bold text-white mt-1">{incomingCallInfo.name}</h3>
                 <p className="text-sm text-emerald-300 font-black mt-0.5">{incomingCallInfo.phone}</p>
               </div>
@@ -5142,16 +6265,94 @@ const handleConfirmTowingBooking = async () => {
                   onClick={handleDeclineIncomingCall}
                   className="rounded-xl bg-red-500/20 text-red-300 py-3 text-xs font-bold hover:bg-red-500/30 active:scale-95 transition-all"
                 >
-                  ปฏิเสธ
+                  {t.declineBtn}
                 </button>
                 <a
                   href={`tel:${incomingCallInfo.phone}`}
                   onClick={handleAcceptIncomingCall}
                   className="flex items-center justify-center gap-1.5 rounded-xl bg-emerald-500 text-white py-3 text-xs font-bold hover:bg-emerald-600 active:scale-95 transition-all"
                 >
-                  <PhoneCall className="h-3.5 w-3.5" /> รับสาย
+                  <PhoneCall className="h-3.5 w-3.5" /> {t.answerBtn}
                 </a>
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* MODAL: กรอกข้อมูลให้ครบหลังล็อกอิน LINE ครั้งแรก — LINE ID token มีแค่ชื่อ/รูป/
+            อีเมล(ถ้ามี) ไม่มีเบอร์โทร จึงต้องขอเพิ่มก่อนสร้างโปรไฟล์ลูกค้าจริงในระบบ */}
+        {showLineCompleteProfile && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-in fade-in duration-200">
+            <div className="w-full max-w-xs rounded-3xl bg-white p-6 shadow-2xl border border-slate-100 space-y-4 animate-in zoom-in-95 duration-200">
+              <div className="text-center space-y-1">
+                <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-[#06C755] text-white shadow-md">
+                  <svg className="h-7 w-7" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 2C6.48 2 2 5.87 2 10.5c0 4.02 3.36 7.4 7.93 8.16-.11.5-.68 2.28-.78 2.63 0 0-.02.13.06.18.08.05.17.02.17.02.23-.03 2.65-1.75 3.73-2.47.62.09 1.26.14 1.89.14 5.52 0 10-3.87 10-8.66S17.52 2 12 2z" />
+                  </svg>
+                </div>
+                <h3 className="text-sm font-extrabold text-slate-900">{t.almostDoneTitle}</h3>
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  {t.fillRemainingInfo}
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                <div>
+                  <label className="mb-1 block text-[10px] font-bold text-slate-500">{t.firstNameLabel}</label>
+                  <input
+                    type="text"
+                    value={lineCompleteForm.name}
+                    onChange={(e) => setLineCompleteForm(prev => ({ ...prev, name: e.target.value }))}
+                    placeholder={t.firstNamePlaceholder}
+                    className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-xs font-semibold text-slate-800 outline-none focus:border-sky-400"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-[10px] font-bold text-slate-500">{t.lastNamePlaceholder}</label>
+                  <input
+                    type="text"
+                    value={lineCompleteForm.surname}
+                    onChange={(e) => setLineCompleteForm(prev => ({ ...prev, surname: e.target.value }))}
+                    placeholder={t.lastNamePlaceholder}
+                    className={`w-full rounded-xl border px-3 py-2.5 text-xs font-semibold text-slate-800 outline-none focus:border-sky-400 ${lineCompleteErr.surname ? 'border-red-400' : 'border-slate-200'}`}
+                  />
+                  {lineCompleteErr.surname && <p className="mt-1 text-[10px] font-bold text-red-500">{lineCompleteErr.surname}</p>}
+                </div>
+                <div>
+                  <label className="mb-1 block text-[10px] font-bold text-slate-500">{t.phoneNumberLabel}</label>
+                  <input
+                    type="tel"
+                    value={lineCompleteForm.phone}
+                    onChange={(e) => setLineCompleteForm(prev => ({ ...prev, phone: e.target.value }))}
+                    placeholder="08X-XXX-XXXX"
+                    className={`w-full rounded-xl border px-3 py-2.5 text-xs font-semibold text-slate-800 outline-none focus:border-sky-400 ${lineCompleteErr.phone ? 'border-red-400' : 'border-slate-200'}`}
+                  />
+                  {lineCompleteErr.phone && <p className="mt-1 text-[10px] font-bold text-red-500">{lineCompleteErr.phone}</p>}
+                </div>
+                {/* ช่องอีเมล — โชว์เสมอ (ไม่ใช่แค่ตอนไม่มีค่า) เผื่อ LINE Channel ยังไม่เปิด
+                    Email Address Permission หรือผู้ใช้ไม่ได้กดยินยอมให้แชร์อีเมลตอน consent
+                    ถ้า claims.email มีมาแล้วฟิลด์นี้จะ prefill ไว้ให้ ผู้ใช้แก้ไขได้ */}
+                <div>
+                  <label className="mb-1 block text-[10px] font-bold text-slate-500">{t.emailLabel}</label>
+                  <input
+                    type="email"
+                    value={lineCompleteForm.email}
+                    onChange={(e) => setLineCompleteForm(prev => ({ ...prev, email: e.target.value }))}
+                    placeholder="example@email.com"
+                    className={`w-full rounded-xl border px-3 py-2.5 text-xs font-semibold text-slate-800 outline-none focus:border-sky-400 ${lineCompleteErr.email ? 'border-red-400' : 'border-slate-200'}`}
+                  />
+                  {lineCompleteErr.email && <p className="mt-1 text-[10px] font-bold text-red-500">{lineCompleteErr.email}</p>}
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleSubmitLineCompleteProfile}
+                disabled={lineCompleteSubmitting}
+                className="w-full rounded-xl bg-gradient-to-r from-sky-500 to-sky-600 py-3 text-xs font-bold text-white shadow-md shadow-sky-200 hover:from-sky-600 hover:to-sky-700 active:scale-95 transition-all disabled:opacity-60"
+              >
+                {lineCompleteSubmitting ? t.savingEllipsis : t.getStartedBtn}
+              </button>
             </div>
           </div>
         )}
@@ -5164,7 +6365,7 @@ const handleConfirmTowingBooking = async () => {
                 <CheckCircle2 className="h-11 w-11 stroke-[2.5]" />
               </div>
               <div className="space-y-1.5">
-                <h3 className="text-base font-extrabold text-slate-900">ขอบคุณสำหรับคะแนนรีวิว!</h3>
+                <h3 className="text-base font-extrabold text-slate-900">{t.thankYouForReviewTitle}</h3>
                 <div className="flex items-center justify-center gap-0.5">
                   {[1, 2, 3, 4, 5].map((star) => (
                     <Star
@@ -5178,14 +6379,14 @@ const handleConfirmTowingBooking = async () => {
                   ))}
                 </div>
                 <p className="text-xs text-slate-500 leading-relaxed pt-1">
-                  ขอบคุณที่ให้คะแนนและใช้บริการกับเรา ความคิดเห็นของคุณช่วยให้เราพัฒนาการบริการต่อไป
+                  {t.thankYouForReviewMsg}
                 </p>
               </div>
               <button
                 onClick={() => setShowReviewThanksModal(false)}
                 className="w-full rounded-xl bg-gradient-to-r from-sky-500 to-sky-600 py-3 text-xs font-bold text-white shadow-md shadow-sky-200 hover:from-sky-600 hover:to-sky-700 active:scale-95 transition-all"
               >
-                ปิดหน้าต่าง
+                {t.closeWindowBtn}
               </button>
             </div>
           </div>

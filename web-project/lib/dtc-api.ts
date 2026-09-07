@@ -64,6 +64,12 @@ export interface TowJob {
   nearestGarage: string;
   garageLat: number | null;
   garageLng: number | null;
+  // เพิ่มสำหรับระบบเสนองานให้ช่างใกล้สุดก่อน (ดู 0012_nearest_tech_offer_dispatch.sql)
+  // offeredTechId: ช่างที่ระบบกำลังเสนองานนี้ให้อยู่ตอนนี้ (null = ยังไม่มี/fallback broadcast
+  // ให้ทุกคนที่ specialty ตรงเห็น) offerExpiresAt: เวลาที่ offer นี้จะหมดอายุ ถ้าช่างไม่ตอบ
+  // ภายในเวลานี้ ระบบจะเสนอให้ช่างใกล้สุดคนถัดไปอัตโนมัติ
+  offeredTechId: string | null;
+  offerExpiresAt: number | null;
 }
 
 export interface TechnicianProfile {
@@ -110,7 +116,103 @@ function mapDbRowToTowJob(row: any): TowJob {
     nearestGarage: row.nearest_garage ?? '',
     garageLat: row.garage_lat ?? null,
     garageLng: row.garage_lng ?? null,
+    offeredTechId: row.offered_tech_id ?? null,
+    offerExpiresAt: row.offer_expires_at ? new Date(row.offer_expires_at).getTime() : null,
   };
+}
+
+// ----------------------------- Routing --------------------------------------
+
+/** จุดเลี้ยว/maneuver หนึ่งจุดตามเส้นทาง (มาจาก OSRM steps หรือ ORS steps ที่ Edge Function
+ *  compute-route แปลงให้เป็นรูปแบบกลางนี้แล้ว) ใช้ทำป้ายบอกเลี้ยวสไตล์ Google Maps ฝั่ง
+ *  worker.tsx (FullScreenNav) — ดูฟังก์ชัน maneuverPhrase()/ManeuverArrow ที่นั่น
+ *
+ *  หมายเหตุความแม่นยำ: ฝั่ง ORS ใช้รหัสตัวเลข (type: 0-13) แทนชื่อ maneuver ที่ Edge
+ *  Function map มาเป็น modifier พวกนี้ตามตารางในเอกสาร ORS — ยังไม่ได้ verify กับ response
+ *  จริง 100% ต่างจากฝั่ง OSRM ที่ maneuver.type/modifier เป็น string ตรงตาม spec ชัดเจนกว่า
+ *  ถ้าเจอป้ายเลี้ยวผิดทิศบ่อยๆ ให้สงสัย mapping ฝั่ง ORS ก่อน */
+export interface RouteStep {
+  /** ระยะทาง (เมตร) ของช่วงถนนนี้ ณ ตอนคำนวณเส้นทาง — ใช้เป็นค่าเริ่มต้นก่อนช่างขยับ
+   *  ฝั่ง UI ควรคำนวณระยะสดจากตำแหน่งช่างจริงไปยัง location แทนถ้าเป็นไปได้ (แม่นกว่า) */
+  distanceMeters: number;
+  /** ชื่อถนน/ทางที่ step นี้วิ่งอยู่ อาจเป็นค่าว่างถ้า OSRM/ORS ไม่มีชื่อให้ (เช่น ถนนไม่มีชื่อ) */
+  name: string;
+  maneuverType:
+    | 'depart'
+    | 'turn'
+    | 'continue'
+    | 'merge'
+    | 'roundabout'
+    | 'arrive'
+    | 'fork'
+    | 'ramp'
+    | 'end_of_road'
+    | 'other';
+  modifier:
+    | 'left'
+    | 'right'
+    | 'slight_left'
+    | 'slight_right'
+    | 'sharp_left'
+    | 'sharp_right'
+    | 'straight'
+    | 'uturn'
+    | null;
+  /** พิกัดจุดที่ต้องทำ maneuver นี้ (จุดเลี้ยว/เข้าวงเวียน/ถึงจุดหมาย ฯลฯ) */
+  location: { lat: number; lng: number };
+}
+
+/** เรียก Edge Function compute-route (OSRM) เพื่อเอาระยะทาง/เวลาเดินทางจริงตามถนน
+ *  แทนการคำนวณเส้นตรง (Haversine) — ใช้ทั้งตอนคิดราคา (จุดเกิดเหตุ -> อู่) และตอนคำนวณ
+ *  ETA แบบสด (ตำแหน่งช่าง -> จุดเกิดเหตุ) คืนค่า null ถ้าเรียกไม่สำเร็จ (เช่น OSRM ล่ม/
+ *  เน็ตหลุด) ให้ผู้เรียกไป fallback เป็น Haversine เดิมเอง จะได้ไม่ทำให้ทั้งแอปพังเพราะ
+ *  Edge Function เดียว */
+export async function computeRoute(
+  origin: { lat: number; lng: number },
+  destination: { lat: number; lng: number }
+): Promise<{
+  distanceKm: number;
+  durationMinutes: number;
+  geometry: { lat: number; lng: number }[];
+  steps: RouteStep[];
+} | null> {
+  try {
+    const { data, error } = await supabase.functions.invoke('compute-route', {
+      body: { origin, destination },
+    });
+    if (error || data?.distanceKm == null || data?.durationMinutes == null) {
+      console.error('[computeRoute] compute-route คืนค่าผิดปกติ:', error || data);
+      return null;
+    }
+    // geometry อาจไม่มีถ้า Edge Function เวอร์ชันเก่ายังไม่รองรับ (deploy ไม่ทัน) — fallback
+    // เป็น array ว่างแทนที่จะ throw เพื่อไม่ให้ ETA/ระยะทางที่ยังใช้งานได้อยู่พังไปด้วย
+    const geometry = Array.isArray(data.geometry)
+      ? data.geometry.map((p: any) => ({ lat: Number(p.lat), lng: Number(p.lng) }))
+      : [];
+    // steps เช่นกัน — ฟิลด์ใหม่กว่า geometry อีก อาจไม่มีเลยถ้า Edge Function ที่ deploy อยู่
+    // ยังเป็นเวอร์ชันก่อนรองรับ turn-by-turn เลย fallback เป็น [] แทนการ throw เหมือนกัน
+    // ฝั่ง UI (worker.tsx) ต้องรองรับ steps=[] แล้วโชว์แค่ป้ายระยะทางรวมแบบเดิมได้เสมอ
+    const steps: RouteStep[] = Array.isArray(data.steps)
+      ? data.steps
+          .filter((s: any) => s?.location && typeof s.location.lat === 'number' && typeof s.location.lng === 'number')
+          .map((s: any) => ({
+            distanceMeters: Number(s.distanceMeters) || 0,
+            name: typeof s.name === 'string' ? s.name : '',
+            maneuverType: s.maneuverType ?? 'other',
+            modifier: s.modifier ?? null,
+            location: { lat: Number(s.location.lat), lng: Number(s.location.lng) },
+          }))
+      : [];
+    return {
+      distanceKm: Number(data.distanceKm),
+      durationMinutes: Number(data.durationMinutes),
+      geometry,
+      steps,
+    };
+  } catch (err) {
+    console.error('[computeRoute] เรียก compute-route ไม่สำเร็จ:', err);
+    return null;
+  }
 }
 
 // ------------------------------- Jobs --------------------------------------
@@ -231,10 +333,23 @@ export async function listPendingAndOwnJobs(techId: string, techSpecialties: str
     .order('created_at', { ascending: false });
   if (error) throw error;
   const jobs = (data ?? []).map(mapDbRowToTowJob);
-  if (techSpecialties.length === 0) return jobs;
-  return jobs.filter(
-    (j) => j.assignedTechId === techId || techSpecialties.includes(j.requiredSpecialty)
-  );
+  const bySpecialty =
+    techSpecialties.length === 0
+      ? jobs
+      : jobs.filter((j) => j.assignedTechId === techId || techSpecialties.includes(j.requiredSpecialty));
+
+  // ซ่อนงานที่ trigger เสนอให้ช่างคนอื่นอยู่ (offer ยังไม่หมดอายุ) ออกจากลิสต์ของช่างคนนี้
+  // ไปเลย — ทำให้ "เสนอทีละคนตามระยะทาง" เป็นจริง ไม่ใช่แค่ UI countdown ลวงตาเหมือนเดิม
+  // (ดูคอมเมนต์หัวไฟล์ 0012_nearest_tech_offer_dispatch.sql) งานที่ offeredTechId เป็น
+  // null (fallback, หาช่างใกล้สุดไม่เจอ) หรือ offer หมดอายุแล้ว ยังคงเห็นได้ตามปกติ
+  const now = Date.now();
+  return bySpecialty.filter((j) => {
+    if (j.assignedTechId === techId) return true; // งานของตัวเองเห็นได้เสมอไม่ว่าจะ offer ให้ใคร
+    if (!j.offeredTechId) return true; // fallback broadcast — ใครก็เห็นได้
+    if (j.offeredTechId === techId) return true; // offer เป็นของช่างคนนี้พอดี
+    if (j.offerExpiresAt && j.offerExpiresAt < now) return true; // offer หมดอายุ (รอ trigger/expire RPC มา sync)
+    return false;
+  });
 }
 
 /** subscribe งานเดี่ยว (ใช้ฝั่งลูกค้า ดูงานของตัวเอง) */
@@ -650,6 +765,36 @@ export async function rejectJobPayment(paymentId: string, verifiedByName: string
   if (error) throw error;
 }
 
+// --------------------------- Technician Earnings Summary ----------------------
+// สำหรับการ์ด "ยอดรายได้ของฉัน" ในหน้าโปรไฟล์ช่าง — เรียก RPC get_tech_earnings_summary ที่
+// เพิ่งสร้างใหม่ (คำนวณยอดรวมจากตาราง jobs/payments จริงฝั่ง server เดียวกับที่ระบบใช้จริง
+// ไม่ต้องมานับซ้ำเองฝั่ง client ให้เสี่ยงตัวเลขไม่ตรงกับฝั่งแอดมิน)
+
+export interface TechEarningsSummary {
+  totalEarnings: number;
+  todayEarnings: number;
+  monthEarnings: number;
+  completedJobs: number;
+}
+
+export async function getMyEarnings(techId: string): Promise<TechEarningsSummary> {
+  const { data, error } = await supabase.rpc('get_tech_earnings_summary', {
+    p_tech_id: techId,
+  });
+  if (error) throw error;
+
+  // RPC อาจคืนค่ามาเป็น array (RETURNS TABLE ได้แถวเดียว) หรือ object เดี่ยวๆ (RETURNS
+  // composite type เดี่ยว) ก็ได้ขึ้นกับนิยามฝั่ง SQL — รองรับไว้ทั้งสองแบบกันเหนียว
+  const row: any = Array.isArray(data) ? data[0] : data;
+
+  return {
+    totalEarnings: Number(row?.total_earnings) || 0,
+    todayEarnings: Number(row?.today_earnings) || 0,
+    monthEarnings: Number(row?.month_earnings) || 0,
+    completedJobs: Number(row?.completed_jobs) || 0,
+  };
+}
+
 // --------------------------- Technician Status Counts -------------------------
 // สำหรับแดชบอร์ดหน้าแรกฝั่งลูกค้า ("ช่างออนไลน์ X คน" ฯลฯ) — เดิมเป็นเลขปลอมคงที่
 // (useState({ online: 18, ... }) ไม่เคยมี setter เรียกเลย) เปลี่ยนมาดึงของจริงผ่าน RPC
@@ -684,4 +829,167 @@ export function subscribeTechStatusCounts(onChange: () => void): () => void {
     .on('postgres_changes', { event: '*', schema: 'public', table: 'technicians' }, () => onChange())
     .subscribe();
   return () => supabase.removeChannel(channel);
+}
+
+// ------------------------------- LINE OAuth (Supabase custom:line) -----------
+// เพิ่มสำหรับฟีเจอร์ล็อกอินด้วย LINE — ใช้ Supabase custom OIDC provider (custom:line)
+// ที่ตั้งค่าไว้แล้วในหน้า Auth Providers ของ Supabase Dashboard สร้าง auth.users ให้
+// อัตโนมัติตอน OAuth สำเร็จ (ผ่าน lib/lineAuth.ts) ฟังก์ชันด้านล่างนี้ใช้ "หลัง" จากที่มี
+// session ของ Supabase Auth แล้วเท่านั้น เพื่อเช็คว่าผู้ใช้คนนี้เคยกรอกโปรไฟล์ (ตาราง
+// customers / technicians) ไว้หรือยัง — ถ้ายัง ต้องพาไปหน้า "กรอกข้อมูลให้ครบ" ก่อน เพราะ
+// LINE ID token ให้แค่ชื่อ/รูป/อีเมล(ถ้าเปิดสิทธิ์) ไม่มีเบอร์โทร/ทะเบียนรถ/เอกสารยืนยันตัวตน
+
+/** เช็คว่า auth user (จาก LINE OAuth) นี้เคยมีแถวโปรไฟล์ลูกค้าอยู่แล้วหรือยัง
+ *  คืน null ถ้ายังไม่เคยกรอกโปรไฟล์ (ต้องพาไปหน้ากรอกข้อมูลเพิ่ม) */
+export async function getCustomerProfileIfExists(customerId: string): Promise<CustomerProfile | null> {
+  const { data, error } = await supabase
+    .from('customers')
+    .select('*')
+    .eq('id', customerId)
+    .maybeSingle();
+  if (error) throw error;
+  return data ? mapDbRowToCustomerProfile(data) : null;
+}
+
+/** บันทึกโปรไฟล์ลูกค้าหลังล็อกอิน LINE สำเร็จครั้งแรก — ต่างจาก registerCustomer() ตรงที่
+ *  "ไม่" เรียก supabase.auth.signUp() ซ้ำ เพราะมี auth session จาก LINE OAuth อยู่แล้ว
+ *  เรียก RPC เดียวกัน (register_customer_profile) ตรงๆ ด้วย customerId ของ session ปัจจุบัน */
+export async function completeCustomerProfileAfterOAuth(input: {
+  customerId: string;
+  name: string;
+  surname: string;
+  phone: string;
+  email: string;
+}): Promise<CustomerProfile> {
+  const { data, error } = await supabase.rpc('register_customer_profile', {
+    p_customer_id: input.customerId,
+    p_name: input.name,
+    p_surname: input.surname,
+    p_phone: input.phone,
+    p_email: input.email,
+  });
+  if (error) throw error;
+  return mapDbRowToCustomerProfile(data);
+}
+
+/** เช็คว่า auth user (จาก LINE OAuth) นี้เคยมีแถวโปรไฟล์ช่างอยู่แล้วหรือยัง
+ *  คืน null ถ้ายังไม่เคยสมัคร (ต้องพาไปหน้าสมัครสมาชิกช่าง — กรอกเบอร์/ทะเบียนรถ/แนบเอกสาร) */
+export async function getTechProfileIfExists(techId: string): Promise<TechAuthProfile | null> {
+  const { data, error } = await supabase
+    .from('technicians')
+    .select('*')
+    .eq('id', techId)
+    .maybeSingle();
+  if (error) throw error;
+  return data ? mapDbRowToTechProfile(data) : null;
+}
+
+// ------------------------------- Garages -------------------------------------
+// เดิมรายชื่ออู่ hardcode อยู่ในฟังก์ชัน findNearestGarage() ของ user-page.tsx ตรงๆ
+// (3 แห่งคงที่ แก้ต้อง deploy โค้ดใหม่) ย้ายมาเก็บในตาราง garages + RPC นี้แทน
+// ดู supabase/migrations/0011_garages_table_and_nearest_garage_rpc.sql
+
+export interface NearestGarage {
+  id: string;
+  name: string;
+  lat: number;
+  lng: number;
+  distanceKm: number;
+}
+
+/** หาอู่ที่ใกล้ที่สุดจากพิกัดที่ส่งมา (ระยะเส้นตรง Haversine คำนวณฝั่ง DB) คืน null ถ้าเรียก
+ *  RPC ไม่สำเร็จ (เช่น เน็ตหลุด/ตาราง garages ว่างเปล่า) — ผู้เรียกควร fallback เป็นรายชื่อ
+ *  อู่สำรองในเครื่องเอง เพื่อไม่ให้ลูกค้าเรียกช่างไม่ได้เลยถ้า RPC มีปัญหาชั่วคราว */
+export async function getNearestGarage(coords: { lat: number; lng: number }): Promise<NearestGarage | null> {
+  try {
+    const { data, error } = await supabase.rpc('get_nearest_garage', {
+      p_lat: coords.lat,
+      p_lng: coords.lng,
+    });
+    if (error) {
+      console.error('[getNearestGarage] get_nearest_garage คืนค่าผิดปกติ:', error);
+      return null;
+    }
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) return null;
+    return {
+      id: row.id,
+      name: row.name,
+      lat: Number(row.lat),
+      lng: Number(row.lng),
+      distanceKm: Number(row.distance_km),
+    };
+  } catch (err) {
+    console.error('[getNearestGarage] เรียก get_nearest_garage ไม่สำเร็จ:', err);
+    return null;
+  }
+}
+
+// --------------------------- Nearest-tech offer dispatch ---------------------
+// ดู supabase/migrations/0012_nearest_tech_offer_dispatch.sql — งานใหม่จะถูกเสนอให้
+// ช่าง online ที่ specialty ตรงและอยู่ใกล้จุดเกิดเหตุที่สุดก่อนโดยอัตโนมัติ (ผ่าน DB
+// trigger ตอน insert) ฟังก์ชันด้านล่างนี้คือฝั่ง client ที่ต้องเรียกเพิ่มเพื่อให้ flow
+// ทำงานครบวงจร (ปฏิเสธ/หมดเวลา -> ส่งต่อช่างคนถัดไป, และ preview ฝั่งลูกค้า)
+
+/** เรียกจาก worker/page.tsx ตอนช่างกดปุ่ม "ปฏิเสธงาน" (declineJob) — ต่างจากเดิมที่แค่
+ *  setDismissedJobIds ซ่อนจากเครื่องตัวเอง อันนี้แจ้ง server จริงว่าคนนี้ไม่รับ เพื่อให้ระบบ
+ *  ส่งต่อให้ช่างที่ใกล้จุดเกิดเหตุที่สุดคนถัดไปทันที ไม่ต้องรอครบเวลา offer หมดอายุเอง
+ *  ทำ fire-and-forget ได้ (ไม่ throw ต่อ) เพราะฝั่ง UI ซ่อนงานจากเครื่องตัวเองไปแล้วไม่ว่า
+ *  call นี้จะสำเร็จหรือไม่ ผู้เรียกไม่จำเป็นต้อง await ผลลัพธ์ก่อนอัปเดต UI */
+export async function declineJobOffer(jobId: string, techId: string): Promise<void> {
+  const { error } = await supabase.rpc('decline_job_offer', {
+    p_job_id: jobId,
+    p_tech_id: techId,
+  });
+  if (error) {
+    console.error('[declineJobOffer] decline_job_offer คืนค่าผิดปกติ:', error);
+    throw error;
+  }
+}
+
+/** เรียกตอน countdown ฝั่งช่างหมดเวลาแล้วยังไม่กดรับ/ปฏิเสธ (เช่น ปิดแอปหนีเฉยๆ) — server
+ *  จะเช็ค offer_expires_at จริงอีกชั้นเอง (ไม่เชื่อเวลาจาก client ตรงๆ) ก่อนส่งต่อคนถัดไป
+ *  เรียกจากฝั่งไหนก็ได้ที่กำลัง watch งานนี้อยู่ (ช่างที่ถือ offer เอง หรือลูกค้าที่รอผลอยู่)
+ *  เผื่อกรณีช่างที่ถือ offer ปิดแอปไปแล้วไม่มีใครเรียกให้ */
+export async function expireStaleJobOffer(jobId: string): Promise<void> {
+  const { error } = await supabase.rpc('expire_stale_job_offer', { p_job_id: jobId });
+  if (error) {
+    console.error('[expireStaleJobOffer] expire_stale_job_offer คืนค่าผิดปกติ:', error);
+    throw error;
+  }
+}
+
+export interface NearbyTechPreview {
+  nearbyCount: number;
+  /** null ถ้าไม่มีช่างว่างในรัศมี preview เลย (ดู _nearby_preview_radius_km ในไฟล์ migration) */
+  nearestDistanceKm: number | null;
+}
+
+/** เรียกจาก user/page.tsx ก่อนลูกค้ากดยืนยันเรียกช่าง — โชว์ "มีช่างว่างใกล้คุณกี่คน ใกล้สุด
+ *  กี่กม." ให้อุ่นใจก่อนกด ไม่ใช่กดแล้วรอเงียบๆ ไม่รู้ว่ามีช่างแถวนั้นจริงไหม คืนค่า nearbyCount:0
+ *  เสมอถ้าเรียก RPC ไม่สำเร็จ (เช่น เน็ตหลุด) แทนที่จะ throw เพราะเป็นแค่ preview ไม่ควรบล็อก
+ *  การเรียกช่างจริงถ้า preview พังชั่วคราว */
+export async function getNearbyTechPreview(
+  coords: { lat: number; lng: number },
+  specialty: string
+): Promise<NearbyTechPreview> {
+  try {
+    const { data, error } = await supabase.rpc('get_nearby_tech_preview', {
+      p_lat: coords.lat,
+      p_lng: coords.lng,
+      p_specialty: specialty,
+    });
+    if (error) {
+      console.error('[getNearbyTechPreview] get_nearby_tech_preview คืนค่าผิดปกติ:', error);
+      return { nearbyCount: 0, nearestDistanceKm: null };
+    }
+    const row = Array.isArray(data) ? data[0] : data;
+    return {
+      nearbyCount: Number(row?.nearby_count) || 0,
+      nearestDistanceKm: row?.nearest_distance_km != null ? Number(row.nearest_distance_km) : null,
+    };
+  } catch (err) {
+    console.error('[getNearbyTechPreview] เรียก get_nearby_tech_preview ไม่สำเร็จ:', err);
+    return { nearbyCount: 0, nearestDistanceKm: null };
+  }
 }
